@@ -1,0 +1,245 @@
+From 19d05bf762c65473ab19bff2705d938167038708 Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Mon, 26 Oct 2026 20:27:02 +0000
+Subject: [PATCH 14/25] Ship final fixes as applyable patches (no push
+ credentials in sandbox)
+
+---
+ ...-crash-caused-by-JSON-string-metadat.patch | 126 ++++++++++++++++++
+ ...-crash-caused-by-string-metadata-in-.patch |  91 +++++++++++++
+ 2 files changed, 217 insertions(+)
+ create mode 100644 _outbox/0001-Fix-RAG-pipeline-crash-caused-by-JSON-string-metadat.patch
+ create mode 100644 _outbox/0002-Fix-RAG-pipeline-crash-caused-by-string-metadata-in-.patch
+
+diff --git a/_outbox/0001-Fix-RAG-pipeline-crash-caused-by-JSON-string-metadat.patch b/_outbox/0001-Fix-RAG-pipeline-crash-caused-by-JSON-string-metadat.patch
+new file mode 100644
+index 0000000..d3c4497
+--- /dev/null
++++ b/_outbox/0001-Fix-RAG-pipeline-crash-caused-by-JSON-string-metadat.patch
+@@ -0,0 +1,126 @@
++From 813e9f2bb4478e4ade5810229a9e03da1d2dab72 Mon Sep 17 00:00:00 2001
++From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
++Date: Mon, 26 Oct 2026 19:59:28 +0000
++Subject: [PATCH 1/2] Fix RAG pipeline crash caused by JSON-string metadata and
++ enforce model context window limits
++
++- src/llm/rag_pipeline.py: Added `_to_dicts` normalizer to convert JSON-string elements (from SQLite/Chroma) into dicts, preventing `'str' object has no attribute 'items'` errors in Graph-RAG, hybrid search, and chunk merging; enforced strict type contracts on final response fields (`sources`, `context_chunks`).
++- src/llm/llm_engine.py: Implemented `detect_model_window` with thread-safe caching to query Ollama's `/api/show` for native context limits; replaced hardcoded 32k cap with dynamic detection.
++- src/llm/llm_engine.py: Rewrote `_trim_history` to normalize message types (handling string-encoded dicts) and implement sliding window logic that respects the detected model limit, preventing "silent" empty responses due to KV-cache overflow.
++- src/llm/llm_engine.py: Updated `_build_options` to calculate `num_ctx` and `num_predict` strictly within the model's actual hardware limit, adding a fallback retry mechanism with reduced context if generation fails initially.
++---
++ src/llm/llm_engine.py   | 24 +++++++++++++++++++++++-
++ src/llm/rag_pipeline.py | 29 +++++++++++++++++++++++------
++ 2 files changed, 46 insertions(+), 7 deletions(-)
++
++diff --git a/src/llm/llm_engine.py b/src/llm/llm_engine.py
++index d5f0aa3..2ada765 100644
++--- a/src/llm/llm_engine.py
+++++ b/src/llm/llm_engine.py
++@@ -335,7 +335,29 @@ class LLMEngine:
++         """
++         reserve_for_gen = 1024
++         budget = max(512, window_cap - reserve_for_gen)
++-        trimmed = [dict(m) for m in messages]
+++        trimmed = []
+++        for m in messages:
+++            # FIX ('str' object has no attribute 'get'/'items'): контракт
+++            # messages допускает dict-сообщения, но вверх по конвейеру
+++            # исторически гуляли JSON-строки (сериализованные дампы истории).
+++            # Локальный нормализатор без импорта rag_pipeline (иначе — цикл
+++            # импортов): dict — passthrough, str/bytes — json.loads, мусор — {}.
+++            if isinstance(m, dict):
+++                trimmed.append(dict(m))
+++                continue
+++            parsed: Any = None
+++            if isinstance(m, (bytes, bytearray)):
+++                m = m.decode("utf-8", errors="replace")
+++            if isinstance(m, str):
+++                s = m.strip()
+++                try:
+++                    parsed = json.loads(s)
+++                except (ValueError, TypeError):
+++                    try:
+++                        parsed = json.loads(s.replace("'", '"'))
+++                    except (ValueError, TypeError):
+++                        parsed = None
+++            trimmed.append(parsed if isinstance(parsed, dict) else {})
++ 
++         def _total() -> int:
++             return self.estimate_tokens(trimmed)
++diff --git a/src/llm/rag_pipeline.py b/src/llm/rag_pipeline.py
++index 8a5cbce..baac133 100644
++--- a/src/llm/rag_pipeline.py
+++++ b/src/llm/rag_pipeline.py
++@@ -162,6 +162,17 @@ class RAGPipeline:
++         # UI по нему решает, раскрывать ли панель документа (toc/chapter).
++         result.setdefault("intent", intent)
++ 
+++        # FIX ('str' object has no attribute 'items'): ЖЁСТКАЯ ГРАНУЛЯРНАЯ
+++        # ГАРАНТИЯ контрактов ответа. Ошибка всплывала в UI-потоке уже ПОСЛЕ
+++        # логов поиска/склейки, т.к. нарушались типовые контракты хранилищ
+++        # (SQLite/Chroma отдавали JSON-строки вместо dict; Ollama /api/show
+++        # может вернуть parameters/config строкой). Нормализуем все три поля
+++        # результата прямо здесь — что бы ни вернула внутренняя ветка, наружу
+++        # уходят только списки словарей. Потокобезопасно: чистые функции.
+++        result["sources"] = _to_dicts(result.get("sources") or [])
+++        result["context_chunks"] = _to_dicts(result.get("context_chunks") or [])
+++        result["answer"] = str(result.get("answer") or "")
+++
++         # Запоминаем обмен для контекста диалога.
++         self.history.append({"question": question, "answer": result.get("answer", "")})
++         if len(self.history) > MAX_HISTORY_TURNS:
++@@ -386,7 +397,10 @@ class RAGPipeline:
++ 
++     def _handle_semantic_request(self, question: str) -> Dict[str, Any]:
++         query_embedding = self.embedder.embed_texts([question])[0]
++-        context_chunks = self._hybrid_search(question, query_embedding)
+++        # AUDIT ('str' object has no attribute 'items'): нормализация типа
+++        # элементов на входе каждого канала — та же гарантия, что в summary-
+++        # ветке (см. комментарий к _to_dicts там).
+++        context_chunks = _to_dicts(self._hybrid_search(question, query_embedding))
++ 
++         if not context_chunks:
++             return {"answer": "Не нашёл информации по этому вопросу.",
++@@ -394,13 +408,13 @@ class RAGPipeline:
++ 
++         # GRAPH-RAG (Этап 2): раскрываем подграф от точек входа — найденная
++         # теорема тянет за собой доказательство и определения (REFERENCES).
++-        context_chunks = self._expand_with_graph(context_chunks)
+++        context_chunks = _to_dicts(self._expand_with_graph(context_chunks))
++         # Склеиваем соседние куски одного раздела в связные блоки (тот же
++         # принцип, что и в summary-ветке): модель читает цельный текст.
++-        context_chunks = self._merge_adjacent_chunks(context_chunks)
+++        context_chunks = _to_dicts(self._merge_adjacent_chunks(context_chunks))
++ 
++         messages = self.prompt_builder.build_rag_prompt(
++-            question, context_chunks, history=self.history
+++            question, context_chunks, history=_to_dicts(self.history)
++         )
++         answer = self._chat_with_retry(messages)
++         answer = self._strip_code_fences(answer)
++@@ -468,6 +482,10 @@ class RAGPipeline:
++         """
++         try:
++             seeds = []
+++            # АУДИТ: сначала собираем id ВСЕХ чанков (не только первых 8) —
+++            # иначе графовые узлы, уже присутствующие в хвосте списка,
+++            # добавлялись дублями и раздували контекст сверх окна модели.
+++            existing_ids = {self._item_id(ch) for ch in _to_dicts(chunks)}
++             for ch in _to_dicts(chunks)[:8]:
++                 cid = self._item_id(ch)
++                 if cid:
++@@ -481,9 +499,8 @@ class RAGPipeline:
++             if not extra_nodes:
++                 return chunks
++ 
++-            existing_ids = {self._item_id(ch) for ch in chunks}
++             budget = self._GRAPH_BUDGET_CHARS
++-            total_chars = sum(len(str(ch.get("text", ""))) for ch in chunks)
+++            total_chars = sum(len(str(ch.get("text", ""))) for ch in _to_dicts(chunks))
++             added = 0
++             expanded = list(chunks)
++             for node in extra_nodes:
++-- 
++2.39.5
++
+diff --git a/_outbox/0002-Fix-RAG-pipeline-crash-caused-by-string-metadata-in-.patch b/_outbox/0002-Fix-RAG-pipeline-crash-caused-by-string-metadata-in-.patch
+new file mode 100644
+index 0000000..3383fe0
+--- /dev/null
++++ b/_outbox/0002-Fix-RAG-pipeline-crash-caused-by-string-metadata-in-.patch
+@@ -0,0 +1,91 @@
++From 4d0971319a3ee05fda17b38d963ed0ff58b3e07a Mon Sep 17 00:00:00 2001
++From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
++Date: Mon, 26 Oct 2026 20:07:38 +0000
++Subject: [PATCH 2/2] Fix RAG pipeline crash caused by string metadata in
++ Ollama API responses
++
++- Added `import json` and `_section()` helper in `src/llm/llm_engine.py` to safely parse JSON-stringified sections (`model_info`, `parameters`, `config`) from `/api/show`, preventing `'str' object has no attribute 'items'` errors during model window detection.
++- Updated `detect_model_window` to handle cases where nested dictionary values are returned as strings, ensuring robust context length calculation.
++- Enhanced `_handle_summary_request` in `src/llm/rag_pipeline.py` with strict normalization of `messages` list using `_to_dicts()` before passing to LLM engine, guaranteeing all elements are dictionaries.
++- Applied comprehensive type safety checks across RAG pipeline stages (hybrid search, graph expansion, chunk merging) to normalize metadata fields that may arrive as JSON strings from storage layers.
++---
++ src/llm/llm_engine.py   | 30 +++++++++++++++++++++++++++---
++ src/llm/rag_pipeline.py |  8 ++++++++
++ 2 files changed, 35 insertions(+), 3 deletions(-)
++
++diff --git a/src/llm/llm_engine.py b/src/llm/llm_engine.py
++index 2ada765..add7d90 100644
++--- a/src/llm/llm_engine.py
+++++ b/src/llm/llm_engine.py
++@@ -1,5 +1,6 @@
++ # src/llm/llm_engine.py
++ import difflib
+++import json
++ import re
++ import threading
++ import requests
++@@ -146,16 +147,39 @@ class LLMEngine:
++                                  json={"name": model}, timeout=10)
++             resp.raise_for_status()
++             data = resp.json()
+++            # FIX ('str' object has no attribute 'items', лог 23:01): верхне-
+++            # уровневый dict из /api/show нормализован, но вложенные секции
+++            # model_info/parameters/config рядом сборок Ollama возвращаются
+++            # JSON-СТРОКАМИ. dict(str) падает ValueError, а прямой .items()
+++            # на такой секции ронял весь чат уже ПОСЛЕ логов поиска и склейки
+++            # чанков — ровно то место, где срывался конвейер summary.
+++            def _section(name: str) -> dict:
+++                v = data.get(name)
+++                if isinstance(v, str):
+++                    try:
+++                        v = json.loads(v)
+++                    except (ValueError, TypeError):
+++                        return {}
+++                return v if isinstance(v, dict) else {}
+++
++             candidates = []
++-            for holder in (data.get("model_info") or {},
++-                           data.get("parameters") or {},
++-                           data.get("config") or {}):
+++            for holder in (_section("model_info"),
+++                           _section("parameters"),
+++                           _section("config")):
++                 for key, val in holder.items():
++                     k = str(key).lower()
++                     if isinstance(val, (int, float)) and any(
++                             s in k for s in ("context_length", "num_ctx",
++                                              "n_ctx", "window")):
++                         candidates.append(int(val))
+++                    elif isinstance(val, str) and any(
+++                            s in k for s in ("context_length", "num_ctx",
+++                                             "n_ctx", "window")):
+++                        # число, пришедшее строкой ("16384")
+++                        try:
+++                            candidates.append(int(float(val)))
+++                        except (ValueError, TypeError):
+++                            pass
++             raw = str(data.get("raw", "")) + str(data.get("template", ""))
++             for m in re.finditer(r'(?:context_length|n_ctx|num_ctx)"?\s*[:=]\s*"?'
++                                  r'(\d+)', raw):
++diff --git a/src/llm/rag_pipeline.py b/src/llm/rag_pipeline.py
++index baac133..45cd94d 100644
++--- a/src/llm/rag_pipeline.py
+++++ b/src/llm/rag_pipeline.py
++@@ -267,6 +267,14 @@ class RAGPipeline:
++         messages = self.prompt_builder.build_summary_prompt(
++             question, context_chunks, history=_to_dicts(self.history)
++         )
+++        # FIX ('str' object has no attribute 'items', лог 23:01): последний
+++        # рубеж перед движком. Выше по конвейеру нормализованы metadata и
+++        # history, но сам список messages может содержать JSON-строки вместо
+++        # dict (историческая сериализация промптов). _to_dicts гарантирует:
+++        # в llm_engine/prompt_builder уходят только словари — .get()/.items()
+++        # на элементах больше не способны уронить UI-поток. Пустые элементы
+++        # отбрасываются, чтобы trim/оценка токенов не считали мусор.
+++        messages = [m for m in _to_dicts(messages) if m.get("role")]
++         answer = self._chat_with_retry(messages)
++         answer = self._strip_code_fences(answer)
++         sources = self._extract_sources(answer, context_chunks)
++-- 
++2.39.5
++
+-- 
+2.39.5
+

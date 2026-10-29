@@ -1,0 +1,384 @@
+From e857542ce4680fc3bb9b56cac14ff7b0bfefcfe2 Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Mon, 26 Oct 2026 18:32:04 +0000
+Subject: [PATCH 03/25] Refactor LLM continuation, UI rendering, and PDF export
+ to fix duplication and symbol loss
+
+- src/llm/llm_engine.py: Implement _glue_parts using difflib.SequenceMatcher to detect and trim overlapping text during auto-continuation, preventing duplicated sections in concatenated responses.
+- src/ui/chat_view.py: Add clean_inline_math preprocessor to replace LaTeX inline blocks ($...$) with Unicode equivalents before passing to Flet, fixing missing symbols; introduce strict Markdown table parser generating native ft.DataTable components with sanitized cells.
+---
+ src/llm/llm_engine.py |  49 +++++++++
+ src/ui/chat_view.py   | 232 +++++++++++++++++++++++++++++++++++-------
+ 2 files changed, 244 insertions(+), 37 deletions(-)
+
+diff --git a/src/llm/llm_engine.py b/src/llm/llm_engine.py
+index 63d85e6..7ed5953 100644
+--- a/src/llm/llm_engine.py
++++ b/src/llm/llm_engine.py
+@@ -1,4 +1,5 @@
+ # src/llm/llm_engine.py
++import difflib
+ import requests
+ from loguru import logger
+ from typing import List, Dict, Any
+@@ -158,6 +159,44 @@ class LLMEngine:
+                 f"num_ctx={options['num_ctx']}")
+         return content, done_reason
+ 
++    @staticmethod
++    def _glue_parts(prev: str, new: str) -> str:
++        """REFACTORING (ТЗ п.1): склейка частей авто-продолжения БЕЗ дублей.
++
++        Мелкие LLM при дозапросе часто повторяют кусок уже написанного текста
++        (последняя строка, обрывок таблицы или целый раздел). Раньше части
++        конкатенировались как есть, и в ответе появлялись двойные таблицы /
++        заголовки. Здесь на стыке находится наибольшее пересечение хвоста
++        prev и начала new (difflib.SequenceMatcher + точная проверка префикса),
++        и дублирующийся кусок вырезается из начала новой порции.
++
++        Возвращает new без дублирующегося префикса (или исходный new, если
++        пересечения нет). Потокобезопасен: чистая функция над строками.
++        """
++        if not prev or not new:
++            return new
++        tail = prev[-3000:]          # окно поиска пересечения
++        head = new[:3000]
++        sm = difflib.SequenceMatcher(a=tail, b=head, autojunk=False)
++        best_len, best_j = 0, 0
++        for _i, j, size in sm.get_matching_blocks():
++            # считаем только блоки, доходящие до самого начала новой порции —
++            # именно они означают «модель повторила хвост предыдущего ответа»
++            if j == 0 and size > best_len:
++                best_len, best_j = size, j
++        # Дубликаты часто отличаются одной новой строкой/пробелом на стыке —
++        # точная проверка длиннейшего префикса head, встречаемого в tail.
++        max_k = min(len(head), len(tail), 2500)
++        for k in range(max_k, best_len, 8):
++            if tail.endswith(head[:k]):
++                best_len = k
++                break
++        if best_len >= 12:
++            logger.info(f"LLM: вырезано дублирующееся продолжение "
++                        f"на стыке частей ({best_len} симв.)")
++            return new[best_len:]
++        return new
++
+     def chat(self, messages: List[Dict[str, Any]], stream: bool = False) -> str:
+         """Отправляет сообщения в Ollama и возвращает ответ.
+ 
+@@ -197,6 +236,16 @@ class LLMEngine:
+         try:
+             for attempt in range(MAX_CONTINUATIONS + 1):
+                 content, done_reason = self._post_chat(model, cont_messages, options)
++                # ТЗ п.1: перед конкатенацией вырезаем дублирующийся хвост
++                # предыдущей части (модель часто повторяет последнюю строку,
++                # обрывок таблицы или целый раздел).
++                if full_parts and content.strip():
++                    prev_joined = "\n".join(p for p in full_parts if p.strip())
++                    content = self._glue_parts(prev_joined, content)
++                    if not content.strip():
++                        logger.info("LLM: продолжение целиком дублировало "
++                                    "предыдущий ответ — кусок отброшен.")
++                        continue
+                 full_parts.append(content)
+                 if done_reason != "length":
+                     break
+diff --git a/src/ui/chat_view.py b/src/ui/chat_view.py
+index 62f4b4b..4b27c71 100644
+--- a/src/ui/chat_view.py
++++ b/src/ui/chat_view.py
+@@ -47,6 +47,113 @@ _SOURCES_SECTION_RE = re.compile(
+     re.IGNORECASE)
+ 
+ 
++# ---------------------------------------------------------------------------
++# PREPROCESSOR (ТЗ п.2): сырой ответ ИИ НИКОГДА не передаётся в ft.Markdown
++# напрямую — Flet вырезает латинские буквы и знаки, обёрнутые в $ ... $
++# (получаются пустые места на экране). Инлайн-блоки $...$ принудительно
++# заменяются стандартными текстовыми эквивалентами Юникода ДО передачи во
++# Flet; очищенный текст выводится обычными текстовыми контролами.
++# Потокобезопасно: чистые функции над строками, без общего состояния.
++# ---------------------------------------------------------------------------
++
++_INLINE_MATH_MAP = {
++    r"\notin": "\u2209",   # ∉  (ПЕРЕД \in — иначе подстрока съест команду)
++    r"\in": "\u2208",      # ∈
++    r"\not\in": "\u2209",
++    r"\forall": "\u2200",  # ∀
++    r"\exists": "\u2203",  # ∃
++    r"\nexists": "\u2204",
++    r"\dots": "\u2026",    # …
++    r"\ldots": "\u2026",
++    r"\cdots": "\u2026",
++    r"\emptyset": "\u2205",  # ∅
++    r"\varnothing": "\u2205",
++    r"\subseteq": "\u2286",
++    r"\supseteq": "\u2287",
++    r"\subset": "\u2282",
++    r"\supset": "\u2283",
++    r"\bigcup": "\u22c3",
++    r"\bigcap": "\u22c2",
++    r"\cup": "\u222a",
++    r"\cap": "\u2229",
++    r"\setminus": "\u2216",
++    r"\land": "\u2227",
++    r"\lor": "\u2228",
++    r"\neg": "\u00ac",
++    r"\implies": "\u21d2",
++    r"\iff": "\u21d4",
++    r"\to": "\u2192",
++    r"\rightarrow": "\u2192",
++    r"\leq": "\u2264",
++    r"\geq": "\u2265",
++    r"\neq": "\u2260",
++    r"\approx": "\u2248",
++    r"\sum": "\u2211",
++    r"\prod": "\u220f",
++    r"\int": "\u222b",
++    r"\infty": "\u221e",
++    r"\partial": "\u2202",
++    r"\nabla": "\u2207",
++    r"\cdot": "\u00b7",
++    r"\times": "\u00d7",
++    r"\div": "\u00f7",
++    r"\pm": "\u00b1",
++    r"\mathbb{R}": "\u211d",
++    r"\mathbb{N}": "\u2115",
++    r"\mathbb{Z}": "\u2124",
++    r"\mathbb{Q}": "\u211a",
++    r"\mathbb{C}": "\u2102",
++}
++# Команды сортируются по убыванию длины: \notin раньше \in, \subseteq раньше \subset.
++_SORTED_MATH_KEYS = sorted(_INLINE_MATH_MAP, key=len, reverse=True)
++
++
++def _latex_inline_to_unicode(latex: str) -> str:
++    """LaTeX-тело инлайн-формулы → юникод-текст (\\exists → ∃, \\in → ∈…)."""
++    s = latex.strip()
++    for cmd in _SORTED_MATH_KEYS:
++        if cmd in s:
++            s = s.replace(cmd, " " + _INLINE_MATH_MAP[cmd] + " ")
++    # остаточные backslash-команды (\hat{x}, \vec a…) — просто снимаем слэш,
++    # чтобы Flet не вырезал символы: «\alpha» → «alpha», «\;» → пробел
++    s = re.sub(r"\\[A-Za-z]+", lambda m: m.group(0)[1:], s)
++    s = s.replace("\\", "")
++    # одиночные латинские буквы/цифры в формуле ($A$, $x_1$, "$A, B, C$") —
++    # обычный текст: убираем служебные скобки LaTeX и склеиваем
++    s = re.sub(r"[{}]", "", s)
++    s = s.replace("_", "\u2009")  # нижние индексы: «a_1» → «a₁» читаемо тонким пробелом
++    s = re.sub(r"\s{2,}", " ", s).strip()
++    return s
++
++
++def clean_inline_math(text: str) -> str:
++    """Преобразует инлайн-блоки $...$ в текстовые юникод-эквиваленты.
++
++    ТЗ п.2: полностью исключает передачу сырых $...$ во Flet — латинские
++    буквы и математические знаки больше не вырезаются. Display-блоки $$...$$
++    не трогает (они уходят в отдельный PNG/MathML-путь рендера).
++    """
++    if not text or "$" not in text:
++        return text
++    # Сначала защищаем display-блоки $$...$$ от разрезания одинарными $.
++    blocks: List[str] = []
++
++    def _save_block(m):
++        blocks.append(m.group(0))
++        return "\x00BLK%d\x00" % (len(blocks) - 1)
++
++    text = re.sub(r"\$\$(.+?)\$\$", _save_block, text, flags=re.DOTALL)
++    # Инлайн $...$ → unicode-эквиваленты с обрамляющими пробелами
++    text = re.sub(r"(?<!\\)\$(?!\$)([^$\n]+?)\$",
++                  lambda m: " " + _latex_inline_to_unicode(m.group(1)) + " ",
++                  text)
++    # Экранированные \$ — просто доллары
++    text = text.replace("\\$", "$")
++    # Возвращаем display-блоки нетронутыми
++    text = re.sub(r"\x00BLK(\d+)\x00", lambda m: blocks[int(m.group(1))], text)
++    return re.sub(r"[ \t]{2,}", " ", text)
++
++
+ def strip_duplicate_sources(text: str) -> str:
+     """Убирает финальный раздел «Источники» со списком [N] из ответа LLM."""
+     if not text or "сточник" not in text.lower():
+@@ -205,20 +312,24 @@ def _render_bare_formula_segment(seg: str, render_inline):
+ 
+ 
+ def _md_block(text: str, extra_inline: bool = True) -> ft.Control:
+-    """Безопасный блок ft.Markdown с защитой инлайн-формул.
++    """Безопасный блок текста/Markdown с ПРЕПРОЦЕССОРАМИ (ТЗ п.2).
+ 
+     REFACTORING (ТЗ п.1): если после защиты остались маркеры {{FORMULA:N}},
+     для которых нет LaTeX (мелкая LLM скопировала служебные токены из примера
+     промпта), они вырезаются — пользователь никогда не увидит сырой
+     плейсхолдер. Битые [текст](page:N) ссылки нормализуются в канон |page:N|.
+ 
+-    FIX (проблема 1 ТЗ): одиночные математические юникод-символы вне $...$
+-    оборачиваются в формулы до подачи в markdown.
++    REFACTORING (ТЗ п.2): инлайн-формулы $...$ принудительно заменяются
++    юникод-эквивалентами (clean_inline_math) ДО передачи во Flet — латинские
++    буквы и кванторы больше не вырезаются в пустые места. Display-блоки
++    $$...$$ сохраняются для PNG/MathML-пути (_protect_formulas).
+     """
+     formulas: List[str] = []
+     text = normalize_page_links(_normalize_formula_tokens(text))
+     if extra_inline:
+-        text = wrap_bare_math_unicode(text)
++        # ТЗ п.2: сначала «голые» unicode-символы приводятся к канону $...$,
++        # затем ВСЕ инлайн-блоки переводятся в текстовые юникод-эквиваленты.
++        text = clean_inline_math(wrap_bare_math_unicode(text))
+     src_text = _protect_formulas(text, formulas) if extra_inline else text
+     # Маркеры без известного LaTeX → удаляем (плейсхолдеры не должны
+     # попадать на экран; канон {{FORMULA:N}} уже приведён нормализатором).
+@@ -230,56 +341,86 @@ def _md_block(text: str, extra_inline: bool = True) -> ft.Control:
+ 
+ 
+ def _table_cell_content(cell: str, render_inline):
+-    """Содержимое ячейки markdown-таблицы.
+-
+-    REFACTORING (ТЗ п.1 «интеграция формул в таблицы»): ft.Markdown сам не
+-    умеет рисовать LaTeX-картинки, а flet_markdown строит таблицу из простых
+-    Text — поэтому таблица собирается вручную через ft.DataTable, и каждая
+-    ячейка компилируется переданным компилятором строк (текст + инлайн-формулы
+-    в одном Row). Пустая/битая ячейка никогда не даёт падение рендера.
+-
+-    FIX (проблема 1 ТЗ — пустые ячейки «Символ»/«Пример использования»):
+-    если в ячейке нет ни одной $...$-формулы, но её короткий текст выглядит
+-    как «плоская» формула (∃, ∀, A ⊂ B, \\exists x), он оборачивается в $...$
+-    и рендерится полноценной формулой, а не теряется в ft.Markdown.
++    """Содержимое ячейки markdown-таблицы (ТЗ п.3 — строгий табличный UI).
++
++    REFACTORING (ТЗ п.2/п.3): каждая ячейка наполняется ЭЛЕМЕНТАМИ ft.Text с
++    применением очистки инлайнов clean_inline_math — никаких сырых $...$ в
++    контролах, никаких пустых ячеек и чёрных прямоугольников. Если очистка
++    не оставила текста, ячейка печатает читаемый прочерк «—».
++
++    Display-формулы $$...$$ внутри ячейки передаются компилятору строк
++    (PNG/MathML-путь), текстовые сегменты — обычным ft.Text.
+     """
+     try:
+         c = (cell or "").strip()
+-        if c and "$" not in c and looks_like_bare_formula(c):
+-            return _render_bare_formula_segment(c, render_inline)
+-        ctrl = render_inline(c)
+-        if isinstance(ctrl, ft.Container) and not getattr(ctrl, "content", None) \
+-                and not getattr(ctrl, "visible", True):
++        if not c:
++            return ft.Text("—", size=13, color="#9E9E9E")
++        # Табличные ячейки — короткие: переводим ВСЕ формулы в unicode-текст
++        cleaned = clean_inline_math(wrap_bare_math_unicode(c))
++        cleaned = re.sub(r"\$\$(.+?)\$\$", lambda m: " " + m.group(1).strip() + " ",
++                         cleaned, flags=re.DOTALL)  # display-тело без $ во Text
++        cleaned = cleaned.strip()
++        if not cleaned:
+             return ft.Text("—", size=13, color="#9E9E9E")
++        ctrl = ft.Markdown(cleaned, selectable=True,
++                           extension_set=ft.MarkdownExtensionSet.GITHUB_FLAVORED)
++        # Фолбэк против «чёрного прямоугольника»: если по какой-то причине
++        # markdown получился пустым — возвращаем plain Text.
++        if not cleaned.replace("#", "").replace("*", "").strip():
++            return ft.Text(cleaned, size=13)
+         return ctrl
+     except Exception as ex:  # pragma: no cover - защитный рендер
+         logger.debug(f"Ячейка таблицы не скомпилирована: {ex}")
+         return ft.Text((cell or "").strip() or "—", size=13)
+ 
+ 
+-def _build_table_block(table_lines: List[str], render_inline) -> Optional[ft.Control]:
+-    """Собирает markdown-таблицу (список строк «| a | b |») в ft.DataTable."""
+-    rows_data: List[List[str]] = []
++def _parse_markdown_table(table_lines: List[str]):
++    """СТРОГИЙ парсер markdown-таблицы (ТЗ п.3).
++
++    Извлекает заголовки колонок и строки данных программно; строка-
++    разделитель |---|:--:| отбрасывается, строки с другим числом колонок
++    выравниваются (недостающие дописываются пустыми, лишние отсекаются).
++    Возвращает (headers: List[str], rows: List[List[str]]) или None.
++    """
++    parsed: List[List[str]] = []
+     for ln in table_lines:
+-        s = ln.strip().strip("|")
++        s = ln.strip().strip("|").strip()
++        if not s:
++            continue
+         cells = [c.strip() for c in s.split("|")]
+         if all(set(c) <= set("-: ") and c for c in cells):
+-            continue  # строка-разделитель |---|---|
+-        rows_data.append(cells)
+-    if not rows_data:
++            continue  # разделитель |---|---|
++        parsed.append(cells)
++    if not parsed:
+         return None
+-    header_cells, body_rows = rows_data[0], rows_data[1:]
++    ncols = max(len(r) for r in parsed)
++    norm = [(r + [""] * (ncols - len(r)))[:ncols] for r in parsed]
++    return norm[0], norm[1:]
++
++
++def _build_table_block(table_lines: List[str], render_inline) -> Optional[ft.Control]:
++    """Собирает markdown-таблицу (список строк «| a | b |») в ft.DataTable.
++
++    REFACTORING (ТЗ п.3): заголовки и строки извлекаются СТРОГИМ парсером
++    _parse_markdown_table; каждая ячейка — ft.DataCell c элементом ft.Text /
++    ft.Markdown, наполненным через очистку инлайнов (Шаг 2). Пустые ячейки
++    и дублирование таблицы исключены: при любом провале сборки возвращается
++    один фолбэк-блок, никогда не две таблицы.
++    """
++    parsed = _parse_markdown_table(table_lines)
++    if not parsed:
++        return None
++    header_cells, body_rows = parsed
+     ncols = len(header_cells)
+     try:
+         return ft.DataTable(
+-            columns=[ft.DataColumn(ft.Markdown(
+-                h, selectable=True,
+-                extension_set=ft.MarkdownExtensionSet.GITHUB_FLAVORED))
+-                for h in header_cells],
++            columns=[ft.DataColumn(ft.Text(h or "—", size=13,
++                                           weight=ft.FontWeight.BOLD))
++                     for h in header_cells],
+             rows=[
+                 ft.DataRow(cells=[
+                     ft.DataCell(_table_cell_content(c, render_inline))
+-                    for c in (row[:ncols] + [""] * max(0, ncols - len(row)))
++                    for c in row[:ncols]
+                 ])
+                 for row in body_rows
+             ],
+@@ -987,11 +1128,28 @@ class ChatView:
+             return None
+ 
+     def _render_inline_line(self, stripped: str) -> ft.Control:
+-        """Строка ответа с инлайн-формулами: чередование Markdown-сегментов
+-        и мелких PNG-картинок в одном Row (wrap) — без разрыва текста."""
+-        # Сначала защищаем формулы от ft.Markdown ($ в Flet — мат. ограничитель)
++        """Строка ответа с инлайн-формулами (ТЗ п.2 — препроцессор).
++
++        Display-формулы $$...$$ рендерятся PNG-картинками в потоке строки;
++        ИНЛАЙН-формулы $...$ принудительно переводятся clean_inline_math в
++        текстовые юникод-эквиваленты ДО передачи во Flet — латинские буквы и
++        кванторы больше никогда не вырезаются в пустые места.
++        """
++        # Сначала защищаем display-формулы от ft.Markdown ($ в Flet — мат.
++        # ограничитель); инлайн-формулы при этом уже конвертированы в unicode.
+         formulas: List[str] = []
+         stripped = normalize_page_links(_normalize_formula_tokens(stripped))
++        blocks: List[str] = []
++
++        def _save_block(m):
++            blocks.append(m.group(1).strip())
++            return "{{BLOCKEQ%d}}" % (len(blocks) - 1)
++
++        stripped = re.sub(r"\$\$([^$]+?)\$\$", _save_block, stripped)
++        stripped = clean_inline_math(wrap_bare_math_unicode(stripped))
++        # Возвращаем display-блоки маркерами, которые уходят в PNG-путь
++        for i, body in enumerate(blocks):
++            stripped = stripped.replace("{{BLOCKEQ%d}}" % i, "$$" + body + "$$")
+         protected = _protect_formulas(stripped, formulas)
+         # Маркеры {{FORMULA:N}}, присланные самой моделью (без известного
+         # LaTeX), вырезаем — сырые плейсхолдеры на экране недопустимы (ТЗ п.1).
+-- 
+2.39.5
+

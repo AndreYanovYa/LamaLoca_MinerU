@@ -1,0 +1,83 @@
+# --- UI (Flet) ---
+# Код адаптирован под Flet 1.x: ft.RichText удалён (заменён на ft.Markdown),
+# Tabs собраны через TabBar + TabBarView, запуск через ft.run().
+# По этому диапазону pip поставит именно 1.x (в ТЗ указан «Flet 1.x»).
+flet>=1.0,<2.0
+
+# --- Конфигурация и утилиты ---
+PyYAML>=6.0.2,<7
+requests>=2.32,<3
+platformdirs>=4.3,<5
+loguru>=0.7,<0.10
+tqdm>=4.66,<5
+
+# Точная оценка длины промпта в токенах (анти-«немой» пустой ответ Ollama:
+# эвристика символы/3 недооценивала русско-математические промпты на 30-50%,
+# префлайт-фильтр RAG пропускал 19-23k токенов -> done_reason='length',
+# content=''). Словарь cl100k кэшируется локально; при отсутствии сети код
+# автоматически падает обратно на консервативную эвристику.
+tiktoken>=0.8,<1
+
+# --- Изображения / рендеринг формул ---
+Pillow>=11.0,<13
+# matplotlib нужен ТОЛЬКО для PNG-рендера формул в PDF (fpdf2 не умеет ни
+# MathML, ни SVG; экспортёр гонит LaTeX -> UnicodeMath -> mathtext 300dpi).
+# В UI чата формулы рисует нативный LaTeX-движок Flet (ft.Markdown $$...$$).
+matplotlib>=3.9,<4
+# --- Конвертация LaTeX (AMS) -> MathML/Unicode: UI и текстовые фолбэки ---
+latex2mathml>=3.77.0
+
+# --- Парсинг документов ---
+PyMuPDF>=1.26,<2
+EbookLib>=0.18,<0.20
+beautifulsoup4>=4.12,<5
+lxml>=5.3,<7
+
+# --- Распознавание формул из PDF (Image-to-LaTeX) ---
+# Текстовый слой PDF (даже PyMuPDF) превращает математику в нечитаемую кашу —
+# на таком тексте ИИ учится не сможет. src/processing/formula_recognizer.py
+# прогоняет PNG-зоны формул через локальную модель и возвращает LaTeX.
+#
+# !!! CUDA / СКОРОСТЬ (Windows, RTX 5060 = архитектура Blackwell sm_120) !!!
+# Обычный `pip install -r requirements.txt` тянет torch-зависимости в
+# CPU-режиме — инференс формул идёт на ядрах и «очень медленно».
+# ДО (или сразу после) установки pix2tex поставьте GPU-сборку torch:
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# (cu128 — первая сборка с поддержкой sm_120; cu126 её НЕ имеет!)
+# Требуется драйвер NVIDIA >= 560. Проверка: python -c "import torch;print(torch.cuda.is_available())"
+# Также убедитесь, что само приложение Ollama обновлено до версии с CUDA для
+# RTX 50xx — именно Ollama считает LLM и эмбеддинги (см. scripts/setup_gpu.py).
+# pix2tex (LaTeX-OCR): лёгкая локальная модель (~20 МБ), движок по умолчанию.
+pix2tex[gui]>=0.1.2; python_version < "3.13"
+# Альтернатива поточнее (ставится вручную, требует torch+transformers ~2 ГБ):
+# texify>=0.1.3
+
+# --- Хранилища ---
+chromadb>=1.0,<2
+# sqlite3 входит в стандартную библиотеку Python — отдельный пакет не нужен.
+
+# --- OCR ---
+pytesseract>=0.3.13,<0.4
+# Внимание: pytesseract — только обёртка; сам бинарник Tesseract OCR
+# ставится отдельно (https://github.com/UB-Mannheim/tesseract для Windows)
+# и его путь прописывается в config.yaml (ocr.tesseract_cmd).
+
+# --- Экспорт ---
+fpdf2>=2.7                # экспорт ответов в PDF (кириллица, пагинация)
+
+# --- Тесты ---
+pytest>=8.3,<9
+fonttools>=4.50        # проверка покрытия глифов шрифта для PDF (опционально, есть в fpdf2)
+
+# --- PDF-движок MinerU (основной парсер математики) ---
+# Установка:  pip install -U "mineru[core]>=2.5,<4"
+# Затем ОДИН раз скачать модели:  mineru-models-download  (выбрать pipeline-модели)
+# Без MinerU приложение работает на fallback PyMuPDF+pix2tex (pdf_parser.py).
+
+# --- Опциональный reranker контекста (рекомендуется) ---
+# Cross-encoder FlashRank (ms-marco-MiniLM-L6-v2, CPU ~30 МБ, поверх уже
+# установленного onnxruntime): перед усечением контекста до final_top_k
+# переставляет реально отвечающие на вопрос чанки в начало. Точечные
+# запросы вида «А1 из Теста 2» перестают терять нужную страницу.
+# src/llm/rag_pipeline.py использует его при наличии и работает без него.
+# flashrank>=0.2.4,<1

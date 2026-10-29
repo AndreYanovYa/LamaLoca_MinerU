@@ -1,0 +1,449 @@
+From be3d10508643e7bf4033a7de6b2fb0af8ab91c13 Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Mon, 26 Oct 2026 19:33:35 +0000
+Subject: [PATCH 08/25] Fix PDF export layout and correct Cauchy limit logic in
+ prompts/OCR
+
+- src/processing/text_cleaner.py: New module for OCR noise correction; regexes fix false set-minus ($X \setminus O$) to punctured neighborhood ($\dot{O}$), normalize variants, and wrap bare math Unicode chars into LaTeX.
+- src/llm/prompt_builder.py: Added strict mathematical rules forbidding $X \setminus O(x_0)$ in favor of $\dot{O}(x_0)$; integrated text_cleaner into `normalize_ocr_case` for RAG context preprocessing.
+- src/processing/exporter.py: Refactored PDF generation to use inline tokenization; math symbols/formulas rendered as 300-dpi PNG images via latex_renderer/mathtext to prevent vertical layout breakage; rewrote Markdown table renderer with fixed column widths and embedded image cells.
+- src/processing/text_corrector.py: Integrated `text_cleaner` pipeline before heuristic TOC corrections to ensure mathematical semantics are preserved during OCR post-processing.
+---
+ src/llm/prompt_builder.py        |  39 ++++++++-
+ src/processing/exporter.py       | 116 +++++++++++++++++++++++--
+ src/processing/text_cleaner.py   | 140 +++++++++++++++++++++++++++++++
+ src/processing/text_corrector.py |  15 ++++
+ 4 files changed, 300 insertions(+), 10 deletions(-)
+ create mode 100644 src/processing/text_cleaner.py
+
+diff --git a/src/llm/prompt_builder.py b/src/llm/prompt_builder.py
+index 7435f73..52e0df9 100644
+--- a/src/llm/prompt_builder.py
++++ b/src/llm/prompt_builder.py
+@@ -24,6 +24,12 @@ class PromptBuilder:
+ 8. Текст учебника может быть в ВЕРХНЕМ РЕГИСТРЕ или без форматирования (OCR/скан) —
+    всегда приводи его к нормальному регистру и оформляй markdown-структурой
+    (заголовки ### , списки - , определения **жирным**).
++9. МАТЕМАТИЧЕСКАЯ КОРРЕКТНОСТЬ (предел функции по Коши): ЗАПРЕЩЕНО писать
++   $X \setminus O(x_0)$ / $X \setminus U(x_0)$ — разность с окрестностью
++   означает «все точки, КРОМЕ окрестности» и переворачивает смысл. Только
++   ПРОКОЛОТАЯ окрестность: $x \in \dot{O}(x_0)$ либо
++   $x \in O(x_0) \setminus \{x_0\}$; квантор всеобщности — только по точкам
++   внутри неё: $\forall x \in \dot{O}(x_0) \cap X$.
+ 
+ ОСОБЫЙ РЕЖИМ ДЛЯ ОГЛАВЛЕНИЙ:
+ Если пользователь просит показать оглавление, содержание или структуру книги:
+@@ -157,6 +163,21 @@ class PromptBuilder:
+     [[PROOF]] Доказательство следует из ... [2]
+     Маркеры ставь ТОЛЬКО для определений/теорем/доказательств; обычный
+     связный текст — без маркеров. Это нужно интерфейсу для подсветки блоков.
++13. МАТЕМАТИЧЕСКАЯ КОРРЕКТНОСТЬ (ПМИ, предел функции по Коши).
++   КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать запись вида $X \\setminus O(x_0)$
++   или $X \\setminus U(x_0)$ при формулировании пределов функций по Коши:
++   разность множества с окрестностью означает «ВСЕ точки, КРОМЕ окрестности»
++   — это переворачивает смысл определения и является грубой ошибкой анализа.
++   Определение предела в терминах окрестностей должно использовать
++   ИСКЛЮЧИТЕЛЬНО понятие ПРОКОЛОТОЙ окрестности точки. Записывай её строго:
++   $x \\in \\dot{O}(x_0)$ либо $x \\in O(x_0) \\setminus \\{x_0\\}$.
++   Контролируй логику кванторов: квантор всеобщности по x применяется только
++   к точкам ВНУТРИ проколотой окрестности аргумента:
++   $\\forall x \\in \\dot{O}(x_0) \\cap X$.
++   Эталон корректной формулировки (смысл, не дословное копирование):
++   $$\\lim_{x \\to x_0} f(x) = A \\iff \\forall \\varepsilon > 0 \\;
++   \\exists \\delta > 0 \\; \\forall x \\in \\dot{U}_\\delta(x_0)
++   \\cap X \\; (|f(x) - A| < \\varepsilon)$$
+ 
+ ЭТАЛОННЫЙ ПРИМЕР ОТВЕТА (подражай структуре, не содержимому):
+ 
+@@ -231,7 +252,11 @@ class PromptBuilder:
+ - писать в конце ответа раздел «Источники» или перечислять
+   источники списком (дублирование) — только инлайн-ссылки [N];
+ - упоминать эталонный пример из системного промпта и использовать его
+-  содержимое (множества A\u005ccup B и т.п.) если тема вопроса другая.
++  содержимое (множества A\u005ccup B и т.п.) если тема вопроса другая;
++- писать $X \\setminus O(x_0)$ / $X \\setminus U(x_0)$ в определении предела
++  по Коши — это переворот смысла; только проколотая окрестность:
++  $x \\in \\dot{{O}}(x_0)$ или $x \\in O(x_0) \\setminus \\{{x_0\\}}$,
++  квантор — $\\forall x \\in \\dot{{O}}(x_0) \\cap X$.
+ Обязательно включи хотя бы одну Markdown-таблицу (операции, свойства,
+ классификация или сравнение понятий из темы). ОБЪЁМ МИНИМАЛЬНЫЙ:
+ 1500 слов, целевой 1500-3000 —
+@@ -317,9 +342,19 @@ class PromptBuilder:
+     def normalize_ocr_case(text: str) -> str:
+         """Нормализация OCR-простыни верхнего регистра (fallback-путь, когда
+         LLM недоступна): если текст почти весь CAPS — приводим к обычному
+-        регистру, сохраняя первые буквы предложений и аббревиатуры из <=2 букв."""
++        регистру, сохраняя первые буквы предложений и аббревиатуры из <=2 букв.
++
++        ТЗ раздел 1: перед нормализацией применяется математический
++        препроцессор src.processing.text_cleaner — коррекция OCR-шума
++        проколотых окрестностей (ложная X \\setminus O(x_0) -> x \\in
++        \\dot{O}(x_0)), чтобы в RAG-контекст не попадал перевёрнутый смысл
++        предела по Коши.
++        """
+         import re as _re
+ 
++        from src.processing.text_cleaner import clean_text as _math_clean
++        text = _math_clean(text)
++
+         letters = [ch for ch in text if ch.isalpha()]
+         if not letters:
+             return text
+diff --git a/src/processing/exporter.py b/src/processing/exporter.py
+index 61597e0..4112faa 100644
+--- a/src/processing/exporter.py
++++ b/src/processing/exporter.py
+@@ -225,13 +225,88 @@ _BARE_MATH_CHARS = "\u2200\u2203\u2204\u2208\u2209\u220b\u2282\u2286\u2283\u2287
+                    "\u0393\u0394\u0398\u039b\u039e\u03a0\u03a3\u03a6\u03a8\u03a9"
+ _BARE_MATH_RE = re.compile(rf"[{_BARE_MATH_CHARS}](?:[{_BARE_MATH_CHARS}])?")
+ 
++# ---------------------------------------------------------------------------
++# ТЗ п.1 (СТРОГИЙ ЗАПРЕТ): LaTeX-команды, которые ни при каких условиях НЕ
++# должны попасть в потоковый вывод pdf.write()/pdf.cell(). Если команда
++# уцелела в «текстовом» сегменте (модель написала формулу без $...$), она
++# принудительно изолируется в math-токен -> PNG 300 dpi (latex_renderer).
++# ---------------------------------------------------------------------------
++_FORBIDDEN_TEX_CMDS = (
++    r"\\(?:forall|exists|nexists|in|notin|ni|emptyset|varnothing|subset|"
++    r"subseteq|supset|supseteq|setminus|backslash|land|lor|lnot|neg|"
++    r"implies|iff|to|gets|mapsto|leq|geq|neq|equiv|approx|propto|sum|"
++    r"prod|int|oint|partial|nabla|infty|cup|cap|dot|mathring|lim|"
++    r"alpha|beta|gamma|delta|epsilon|varepsilon|zeta|eta|theta|iota|"
++    r"kappa|lambda|mu|nu|xi|pi|rho|sigma|tau|upsilon|phi|varphi|chi|"
++    r"psi|omega|Gamma|Delta|Theta|Lambda|Xi|Pi|Sigma|Upsilon|Phi|Psi|Omega)"
++    r"\b"
++)
++_FORBIDDEN_MATH_RE = re.compile(
++    # запрещённая команда ИЛИ одиночный '$' (любой остаток формулы)
++    rf"(?:{_FORBIDDEN_TEX_CMDS}|\$)"
++)
++
++
++def _is_math_fragment(seg: str) -> bool:
++    """True, если текстовый сегмент содержит запрещённый math-фрагмент."""
++    return bool(_FORBIDDEN_MATH_RE.search(seg))
++
++
++def _strip_dollars(seg: str) -> str:
++    """Для math-фрагмента без $...$ обёртки убираем оставшиеся '$'."""
++    return seg.replace("$", " ").strip()
++
++
++def _split_forbidden_math(seg: str):
++    """Разрезает ТЕКСТОВЫЙ сегмент по запрещённым math-фрагментам.
++
++    Границы куска расширяются до пробелов/концов строки (кусочки вроде
++    'x \\in X' собираются целиком). Возвращает [('text'|'formula', payload)].
++    """
++    parts = re.split(r"(\s+)", seg)
++    toks, buf = [], ""
++    for p in parts:
++        if re.fullmatch(r"\s+", p or ""):
++            if _is_math_fragment(buf):
++                toks.append(("text", buf)) if False else None
++            buf += p
++            continue
++        if _is_math_fragment(p):
++            if buf.strip():
++                toks.append(("formula", _strip_dollars(buf)))
++            elif buf:
++                toks.append(("text", buf))
++            buf = p
++        else:
++            if buf.strip() and _is_math_fragment(buf):
++                toks.append(("formula", _strip_dollars(buf)))
++            elif buf:
++                toks.append(("text", buf))
++            buf = p
++    if buf.strip():
++        toks.append(("formula" if _is_math_fragment(buf) else "text",
++                     _strip_dollars(buf) if _is_math_fragment(buf) else buf))
++    elif buf:
++        toks.append(("text", buf))
++    # склейка соседних text-токенов
++    merged: list = []
++    for kind, payload in toks:
++        if merged and merged[-1][0] == "text" and kind == "text":
++            merged[-1] = ("text", merged[-1][1] + payload)
++        else:
++            merged.append((kind, payload))
++    return [(k, v) for k, v in merged if v.strip()]
++
+ 
+ def _tokenize_line(line: str):
+     """Инлайн-сборщик строк (ТЗ п.2): line -> [('text'|'formula', payload)].
+ 
+     Порядок: сначала вырезаются $$display$$-блоки, затем $inline$-формулы
+     (экранированные \\$ не трогаются), затем одиночные «голые» math-глифы
+-    Unicode. Пустые сегменты отбрасываются.
++    Unicode; в финале каждый ТЕКСТОВЫЙ сегмент дополнительно проверяется на
++    запрещённые LaTeX-команды (ТЗ п.1) — такие куски принудительно
++    переводятся в math-токены и рендерятся картинкой, а не write()/cell().
++    Пустые сегменты отбрасываются.
+     """
+     def _split_plain(text: str):
+         segs = []
+@@ -273,7 +348,18 @@ def _tokenize_line(line: str):
+         pos = m.end()
+     if line[pos:]:
+         segs.extend(_split_inline(line[pos:]))
+-    return segs
++    # ТЗ п.1 (СТРОГИЙ ЗАПРЕТ): финальный проход — ни один текстовый сегмент
++    # не должен содержать '$' или запрещённых LaTeX-команд (\forall, \exists,
++    # \in, \notin, \emptyset, \subset, \implies ...). Такие куски принудительно
++    # превращаются в math-токены и уходят в latex_renderer (PNG), минуя
++    # pdf.write()/pdf.cell().
++    guarded: list = []
++    for kind, payload in segs:
++        if kind == "text" and _is_math_fragment(payload):
++            guarded.extend(_split_forbidden_math(payload))
++        else:
++            guarded.append((kind, payload))
++    return guarded
+ 
+ 
+ # Совместимость с прежним именем (использовалось в export_to_pdf до рефакторинга)
+@@ -765,7 +851,18 @@ class AnswerExporter:
+             if ncols == 0:
+                 return
+             grid_w = max_w
+-            col_w = grid_w / ncols
++            # ТЗ п.3: ЖЁСТКО заданные ширины колонок (col_widths). Равномерная
++            # сетка — дефолт; если в первом столбце заведомо короткие метки
++            # («Символ»), а остальные — текст, колонкам выдаются фиксированные
++            # доли набора, нормированные до grid_w. Сетка не зависит от
++            # содержимого ячеек и потому никогда не «разъезжается».
++            col_widths = [grid_w / ncols] * ncols
++            pdf.set_font("DejaVu", "", 10)
++            head_w = [pdf.get_string_width(h or " ") for h in headers]
++            if ncols >= 3 and max(head_w[1:]) > 2.2 * max(head_w[0], 1.0):
++                weights = [1.4] + [2.6] * (ncols - 1)
++                total = sum(weights)
++                col_widths = [grid_w * w / total for w in weights]
+             line_h = 5.0
+             pdf.set_font("DejaVu", "B", 10)
+ 
+@@ -773,9 +870,10 @@ class AnswerExporter:
+                 """Предварительная высота строки = сколько строк наберётся."""
+                 pdf.set_font("DejaVu", "B" if bold else "", 10)
+                 pad = 1.2
+-                avail_w = col_w - 2 * pad
+                 max_lines = 1
+-                for c in cells:
++                for ci, c in enumerate(cells):
++                    cw = col_widths[ci] if ci < len(col_widths) else col_widths[-1]
++                    avail_w = cw - 2 * pad
+                     plain = re.sub(r"\*\*(.+?)\*\*", r"\1", c)
+                     plain = re.sub(r"`([^`]+)`", r"\1", plain)
+                     n, cur = 1, ""
+@@ -796,13 +894,15 @@ class AnswerExporter:
+                     pdf.add_page()
+                 y0 = pdf.get_y()
+                 x0 = pdf.l_margin
++                cx = x0
+                 for i, c in enumerate(cells):
+-                    cx = x0 + i * col_w
++                    cw = col_widths[i] if i < len(col_widths) else col_widths[-1]
+                     pdf.set_draw_color(60, 60, 60)
+                     pdf.set_line_width(0.2)
+-                    pdf.rect(cx, y0, col_w, h)     # жёсткая граница ячейки
+-                    render_cell_content(c or "\u2014", cx, y0, col_w,
++                    pdf.rect(cx, y0, cw, h)       # жёсткая граница ячейки
++                    render_cell_content(c or "\u2014", cx, y0, cw,
+                                         line_h, 10, bold, tmp_dir)
++                    cx += cw
+                 pdf.set_xy(x0, y0 + h)
+ 
+             draw_row(headers, bold=True)
+diff --git a/src/processing/text_cleaner.py b/src/processing/text_cleaner.py
+new file mode 100644
+index 0000000..3375e10
+--- /dev/null
++++ b/src/processing/text_cleaner.py
+@@ -0,0 +1,140 @@
++# src/processing/text_cleaner.py
++"""Пре-процессор текста после OCR/LaTeX-распознавания.
++
++ТЗ (раздел 1): автоматическая коррекция шума Tesseract OCR на стыке
++распознавания окрестностей и проколотых точек. Локальная LLM, питаясь
++таким шумом, генерирует ложную «разность множеств» вида ``X \\setminus O(x_0)``
++(«все точки, КРОМЕ окрестности») вместо проколотой окрестности
++``x \\in \\dot{O}(x_0)`` / ``x \\in O(x_0) \\setminus {x_0}``, что переворачивает
++смысл определения предела по Коши.
++
++Правила замены (эталон ТЗ приведён как示意; здесь — синтаксически корректные
++Python-regex с тем же смыслом):
++
++    text = re.sub(r'X\s*\\\s*setminus\s+([UO]\(x_0\))', r'x \\\\in \\\\dot{\\1}', text)
++    text = re.sub(r'X\s*\\\\\s*([UO]\(x_0\))',           r'x \\\\in \\\\dot{\\1}', text)
++
++Модуль потокобезопасен: только чистые функции над строками, без общего
++изменяемого состояния (скомпилированные regex неизменяемы).
++"""
++import re
++
++# ---------------------------------------------------------------------------
++# 1. Ложная разность множества на окрестностью (шум OCR проколотой точки).
++#    Punctured neighbourhood распознаётся Tesseract как "X \ O(x_0)" или
++#    "X \setminus U(x_0)" — обе формы переводим в канон \dot{O}/\dot{U}.
++# ---------------------------------------------------------------------------
++_RE_FALSE_SETMINUS_NBD = re.compile(
++    r"X\s*\\+\s*(?:setminus\s*)?([UO])\(\s*x_0\s*\)",
++)
++
++# "x \in X \ O(x_0)" без следа setminus — точечный шум вокруг "\":
++_RE_BARE_BACKSLASH_NBD = re.compile(
++    r"(?<![A-Za-z])([Xx])\s*\\\s*([UO])\(\s*x_0\s*\)",
++)
++
++
++def _punctured_repl(m: re.Match) -> str:
++    """Каноническая запись проколотой окрестности для найденного совпадения."""
++    nb = m.group(2) if m.re is _RE_BARE_BACKSLASH_NBD else m.group(1)
++    return rf"x \in \dot{{{nb}}}(x_0)"
++
++
++def fix_punctured_neighborhood(text: str) -> str:
++    """Исправляет ложную разность множеств на проколотую окрестность.
++
++    Было (OCR-шум / ошибка модели):
++        X \\setminus O(x_0), X \\ U(x_0), x \\in X \\ O(x_0)
++    Стало (корректный смысл предела по Коши):
++        x \\in \\dot{O}(x_0), x \\in \\dot{U}(x_0)
++    """
++    if not text:
++        return text
++    text = _RE_FALSE_SETMINUS_NBD.sub(_punctured_repl, text)
++    text = _RE_BARE_BACKSLASH_NBD.sub(_punctured_repl, text)
++    return text
++
++
++# ---------------------------------------------------------------------------
++# 2. Канонизация альтернативных записей проколотой окрестности.
++#    \mathring{O}, O^\circ, \overset{\circ}{O} -> \dot{O} — один формат,
++#    который понимает latex_renderer (mathtext) и ожидает системный промпт.
++# ---------------------------------------------------------------------------
++_RE_RING_VARIANTS = [
++    (re.compile(r"\\mathring\{([UO])\}"), r"\\dot{\1}"),
++    (re.compile(r"\\overset\s*\{\\circ\}\{([UO])\}"), r"\\dot{\1}"),
++    (re.compile(r"([UO])\^\\circ\b"), r"\\dot{\1}"),
++]
++
++
++def normalize_punctured_variants(text: str) -> str:
++    for rx, repl in _RE_RING_VARIANTS:
++        text = rx.sub(repl, text)
++    return text
++
++
++# ---------------------------------------------------------------------------
++# 3. Изоляция кванторов/символов: плоский Unicode без $...$ обёртки
++#    (частый вывод мелких LLM и артефактов OCR) оборачивается в LaTeX, чтобы
++#    далее UI/PDF обрабатывали их единым токенайзером.
++# ---------------------------------------------------------------------------
++_UNICODE_TO_LATEX = {
++    "\u2200": r"\forall",   # ∀
++    "\u2203": r"\exists",   # ∃
++    "\u2204": r"\nexists",  # ∄
++    "\u2208": r"\in",       # ∈
++    "\u2209": r"\notin",    # ∉
++    "\u2205": r"\emptyset", # ∅
++    "\u2282": r"\subset",   # ⊂
++    "\u2286": r"\subseteq", # ⊆
++    "\u21d2": r"\implies",  # ⇒
++    "\u2261": r"\equiv",    # ≡
++}
++_RE_FLAT_MATH_RUN = re.compile(
++    "[" + "".join(_UNICODE_TO_LATEX) + r"](?:[,\s]*[" +
++    "".join(_UNICODE_TO_LATEX) + r"])+"
++)
++
++
++def wrap_flat_math(text: str) -> str:
++    """Последовательности голых math-глифов вне $...$ оборачивает в $...$.
++
++    Внутри существующих формул ($...$/$$...$$) ничего не трогаем — иначе
++    сломали бы уже корректный LaTeX.
++    """
++    if not text:
++        return text
++
++    def _repl(m: re.Match) -> str:
++        run = m.group(0)
++        # разделяем глифы запятыми LaTeX-команд
++        parts = []
++        for ch in run:
++            if ch in _UNICODE_TO_LATEX:
++                parts.append(_UNICODE_TO_LATEX[ch])
++            elif ch == ",":
++                parts.append(", ")
++        body = " ".join(parts)
++        return f"${body}$" if body else run
++
++    out_lines = []
++    for line in text.split("\n"):
++        pos, buf = 0, []
++        for dm in re.finditer(r"\$\$.*?\$\$|\$[^$\n]*\$", line):
++            seg = line[pos:dm.start()]
++            buf.append(_RE_FLAT_MATH_RUN.sub(_repl, seg))
++            buf.append(dm.group(0))  # формулы не трогаем
++            pos = dm.end()
++        buf.append(_RE_FLAT_MATH_RUN.sub(_repl, line[pos:]))
++        out_lines.append("".join(buf))
++    return "\n".join(out_lines)
++
++
++def clean_text(text: str) -> str:
++    """Полный конвейер препроцессора (вызывается из TextCorrector)."""
++    if not text:
++        return text
++    text = fix_punctured_neighborhood(text)
++    text = normalize_punctured_variants(text)
++    text = wrap_flat_math(text)
++    return text
+diff --git a/src/processing/text_corrector.py b/src/processing/text_corrector.py
+index 41d12d9..be10754 100644
+--- a/src/processing/text_corrector.py
++++ b/src/processing/text_corrector.py
+@@ -3,10 +3,18 @@
+ 
+ Работает без внешних зависимостей (кроме LLM опционально).
+ Использует эвристики и регулярные выражения для очистки любого текста.
++
++ТЗ раздел 1: перед эвристиками оглавления применяется препроцессор
++``src.processing.text_cleaner`` — автоматическая коррекция шума Tesseract
++на стыке распознавания окрестностей (ложная ``X \\setminus O(x_0)``
++заменяется на проколотую окрестность ``x \\in \\dot{O}(x_0)``), чтобы
++LLM не переворачивала смысл определения предела по Коши.
+ """
+ import re
+ from typing import Optional
+ 
++from .text_cleaner import clean_text as _clean_math_noise
++
+ 
+ class TextCorrector:
+     """Универсальный корректор текста после OCR."""
+@@ -20,12 +28,19 @@ class TextCorrector:
+         Корректирует текст оглавления.
+         
+         Этапы:
++        0. Пре-процессор математики (text_cleaner): коррекция OCR-шума
++           проколотых окрестностей и изоляция плоских math-глифов
+         1. Нормализация символов
+         2. Исправление знаков параграфов и страниц
+         3. Удаление мусора между названием и номером
+         4. Восстановление разорванных слов
+         5. (Опционально) LLM-коррекция
+         """
++        # Этап 0: математический препроцессор ТЗ п.1 (ложная разность
++        # множеств -> проколотая окрестность \dot{O}(x_0)). Работает до
++        # _normalize_chars, который целенаправленно меняет регистр/латиницу.
++        text = _clean_math_noise(text)
++
+         lines = text.split('\n')
+         corrected = []
+         
+-- 
+2.39.5
+

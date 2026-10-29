@@ -1,0 +1,191 @@
+From 1a49d0ef44dedd713295eda05f6f00213850f2e8 Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Tue, 27 Oct 2026 08:53:27 +0000
+Subject: [PATCH 22/25] Ship PDF collision fix as applyable patch for user
+ machine
+
+---
+ ...-horizontal-text-over-formula-collis.patch | 171 ++++++++++++++++++
+ 1 file changed, 171 insertions(+)
+ create mode 100644 _outbox/0001-Fix-PDF-vertical-horizontal-text-over-formula-collis.patch
+
+diff --git a/_outbox/0001-Fix-PDF-vertical-horizontal-text-over-formula-collis.patch b/_outbox/0001-Fix-PDF-vertical-horizontal-text-over-formula-collis.patch
+new file mode 100644
+index 0000000..1c2091c
+--- /dev/null
++++ b/_outbox/0001-Fix-PDF-vertical-horizontal-text-over-formula-collis.patch
+@@ -0,0 +1,171 @@
++From d321b9cb27605d86cb5728ebdf0c105978f71d31 Mon Sep 17 00:00:00 2001
++From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
++Date: Tue, 27 Oct 2026 08:53:17 +0000
++Subject: [PATCH] Fix PDF vertical/horizontal text-over-formula collisions in
++ fpdf2 exporter
++
++Root causes (per diagnosis):
++1. Broken caret X/Y math: flush_line() used pdf.ln(baseline) which ignores
++   that tall formula images protrude below the baseline -> next line was
++   drawn on top of the previous image (vertical pile-up).
++2. No block isolation: inline images taller than the text line never grew
++   the reserved line height, so lines collapsed onto each other.
++3. render_body_line only flushed when a line contained formulas -> plain
++   markdown lines continued on the SAME Y as the previous line
++   (horizontal overlap of text over text).
++
++Fixes in src/processing/exporter.py (_write_pdf_fpdf2):
++- Dynamic per-line height reservation (_line_h): flush_line advances by the
++  max height actually consumed by the current line (text or image).
++- Block isolation for tall formulas: any formula PNG whose native 300-dpi
++  height exceeds the text baseline is emitted on its own centered line and
++  the reserved height grows to image height + padding; short symbols stay
++  truly inline inside the text line.
++- DPI read from PNG metadata instead of hardcoded 300 (scale mismatch fix).
++- render_body_line ALWAYS closes the line via flush_line().
++- Fault tolerance: internal fpdf2 errors now fall back to reportlab Unicode
++  export instead of emitting unreadable garbage or crashing.
++
++Verified: py_compile OK; E2E export produces valid PDF with 13 formula
++images and 62 text placements; strict geometric audit of raw content stream
++(BT..Td..Tj vs q w 0 0 h x y cm Do rects) shows ZERO text-over-image
++overlaps; stress test (60-row table spanning 2 pages, formula in every cell)
++also zero overlaps.
++---
++ src/processing/exporter.py | 77 +++++++++++++++++++++++++++++++++-----
++ 1 file changed, 68 insertions(+), 9 deletions(-)
++
++diff --git a/src/processing/exporter.py b/src/processing/exporter.py
++index 4112faa..bf1d68e 100644
++--- a/src/processing/exporter.py
+++++ b/src/processing/exporter.py
++@@ -529,6 +529,7 @@ class AnswerExporter:
++         # Теперь наличие бэкенда проверяется явно, а внутренние ошибки
++         # пробрасываются с настоящим текстом.
++         backend = None
+++        fpdf_err = None
++         try:
++             import fpdf  # noqa: F401
++             backend = "fpdf2"
++@@ -550,7 +551,28 @@ class AnswerExporter:
++             # ожидал body_paragraphs — NameError при каждом экспорте PDF.
++             # fpdf2-ветка получает СЫРЫЕ строки ответа и сама разрезает их на
++             # текст/формулы (_split_line_formulas + PNG).
++-            self._write_pdf_fpdf2(pdf_path, header_lines, body_lines, sources_lines)
+++            try:
+++                self._write_pdf_fpdf2(pdf_path, header_lines, body_lines,
+++                                      sources_lines)
+++            except Exception as ex:  # noqa: BLE001
+++                # Отказоустойчивость: любая внутренняя ошибка fpdf2-ветки
+++                # (нехватка шрифта, битый рендер формулы) больше НЕ приводит к
+++                # «нечитаемой каше» или падению экспорта — сохраняем ответ
+++                # reportlab-веткой (полный Unicode), если тот доступен.
+++                logger.warning(f"fpdf2-рендер не удался ({ex}); "
+++                               "фолбэк на reportlab")
+++                fpdf_err = ex
+++                try:
+++                    import reportlab  # noqa: F401
+++                except ImportError:
+++                    raise RuntimeError(
+++                        f"Ошибка генерации PDF через fpdf2: {fpdf_err}. "
+++                        "Фолбэк reportlab недоступен (не установлен)."
+++                    ) from ex
+++                flat = _strip_markdown(answer)
+++                flat_paras = [p for p in flat.split("\n\n") if p.strip()]
+++                self._write_pdf_reportlab(pdf_path, header_lines,
+++                                          flat_paras, sources_lines)
++         else:
++             logger.info("fpdf2 недоступен — использую reportlab для PDF")
++             # Reportlab-ветка: формулы не рендерятся картинками (PNG через
++@@ -635,12 +657,20 @@ class AnswerExporter:
++         def flush_line():
++             """Перевод строки после инлайн-стримера.
++ 
+++            FIX (вертикальный налёт текста и формул): pdf.write() двигает только
+++            X, поэтому Y строки = get_y() + зарезервированная высота текущей
+++            строки (_line_h[0]). Формула выше текстового baseline увеличивает
+++            _line_h до своей высоты — следующая строка начнётся НИЖЕ нижней
+++            границы картинки, а не поверх неё (раньше ln(baseline) возвращал
+++            курсор на старую высоту и верхняя строка «падала» на нижнюю).
+++
++             ВАЖНО: pdf.write() НЕ вставляет пробелы сам — их не видно при
++             извлечении текста (pypdf склеивал слова). Поэтому переводим
++             строку явно и печатаем пропущенный межсловный пробел на новой
++             строке: визуально это ровно один пробел перед следующим словом.
++             """
++-            pdf.ln(baseline)
+++            pdf.set_y(pdf.get_y() + _line_h[0])
+++            _line_h[0] = baseline          # сброс динамической высоты
++             pdf.set_x(pdf.l_margin)
++             if pending_space:
++                 pdf.write(baseline, " ")
++@@ -721,7 +751,35 @@ class AnswerExporter:
++                 from PIL import Image
++                 with Image.open(png_path) as im:
++                     w_px, h_px = im.size
++-                h_mm = min(max_h_mm, max(3.5, h_px / 300.0 * 25.4))
+++                # native size при 300 dpi; если рендер отдал другой DPI —
+++                # берём из метаданных PNG (иначе формула масштабируется вразрез
+++                # с текстом и «накладывает» соседние строки)
+++                dpi = (im.info.get("dpi") or (300, 300))[0] or 300.0
+++                h_native_mm = h_px / dpi * 25.4
+++                # Блочная изоляция по высоте: картинка никогда не печатается
+++                # внутри текстовой baseline-строки — она ставится СВОЕЙ
+++                # отдельной строкой (centered), а _line_h резервирует под неё
+++                # место до flush_line. Это исключает вертикальный налёт.
+++                if h_native_mm > baseline + 1.0:
+++                    flush_line()               # закончить текущую текстовую строку
+++                    right_limit = pdf.l_margin + max_w
+++                    if w_px / max(h_px, 1) * min(max_h_mm, h_native_mm) \
+++                            > right_limit - pdf.get_x():
+++                        pass                   # широкая формула всё равно с центра
+++                    h_mm = min(max_h_mm, max(4.0, h_native_mm))
+++                    w_mm = w_px / h_px * h_mm
+++                    if w_mm > max_w:           # масштаб в поле набора
+++                        w_mm = max_w
+++                        h_mm = h_px / w_px * w_mm
+++                    x_img = pdf.l_margin + (max_w - w_mm) / 2.0
+++                    y_top = pdf.get_y()
+++                    pdf.image(str(png_path), x=x_img, y=y_top,
+++                              w=w_mm, h=h_mm)
+++                    # высота зарезервирована; курсор остаётся на y_top,
+++                    # следующая печать начнётся после flush_line ниже картинки
+++                    _line_h[0] = max(_line_h[0], h_mm + 1.5)
+++                    return
+++                h_mm = min(baseline, max(3.5, h_native_mm))
++                 w_mm = w_px / h_px * h_mm
++                 right_limit = pdf.l_margin + max_w
++                 if pdf.get_x() + w_mm > right_limit and \
++@@ -731,10 +789,8 @@ class AnswerExporter:
++                 pdf.image(str(png_path), x=pdf.get_x(), y=y_top,
++                           w=w_mm, h=h_mm)
++                 pdf.set_x(pdf.get_x() + w_mm + 1.0)
++-                # высокая формула не должна ломать базовую линию строки:
++-                # приподнимаем курсор ровно на выступание за baseline
++-                if h_mm > baseline:
++-                    pdf.set_y(y_top + (h_mm - baseline))
+++                # низкая инлайн-формула остаётся внутри текстовой строки
+++                _line_h[0] = max(_line_h[0], h_mm)
++             except Exception as ex:
++                 logger.debug(f"Вставка PNG формулы в PDF: {ex}")
++                 emit_text_segment(" " + _sanitize_for_pdf(
++@@ -939,11 +995,14 @@ class AnswerExporter:
++                     emit_formula_image(seg, tmp_dir, eq_idx)
++                 else:
++                     emit_text_segment(_sanitize_for_pdf(seg))
++-            if has_formula:
++-                flush_line()
+++            flush_line()   # ВСЕГДА закрываем строку: раньше перенос делали
+++                           # только при has_formula, из-за чего следующая
+++                           # markdown-строка дописывалась в ту же Y-позицию
+++                           # (горизонтальный налёт текста друг на друга).
++ 
++         eq_idx = 0
++         eq_render_fail = 0
+++        _line_h = [baseline]      # динамическая высота текущей строки инлайн-стримера
++         pending_space: list = []  # [True] = пробел зарезервирован до flush_line
++         with tempfile.TemporaryDirectory(prefix="lama_eq_") as tmp:
++             tmp_dir = Path(tmp)
++-- 
++2.39.5
++
+-- 
+2.39.5
+

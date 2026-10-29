@@ -1,0 +1,157 @@
+lama-loca/
+│
+├── main.py                              # Точка входа: инициализация ядра → запуск Flet
+├── requirements.txt                     # Ваш утверждённый файл зависимостей
+├── pyproject.toml                       # Метаданные, настройки pytest, ruff/black
+├── .gitignore                           # data/, .venv/, __pycache__, config.yaml, *.db-wal, *.db-shm
+├── README.md                            # Быстрый старт, установка внешних инструментов
+├── config.example.yaml                  # Шаблон конфигурации (хранится в Git)
+│
+├── data/                                # (Игнорируется Git) Все пользовательские данные
+│   ├── library/                         # Оригиналы файлов (только чтение)
+│   │   ├── pdf/
+│   │   ├── epub/
+│   │   ├── fb2/
+│   │   ├── djvu/
+│   │   └── txt_md/
+│   ├── parsed/                          # Результаты обработки по doc_id
+│   │   └── {doc_id}/
+│   │       ├── document.md              # Нормализованный текст (Markdown)
+│   │       ├── metadata.json            # Автор, название, язык, статус импорта
+│   │       ├── pages/                   # (Лениво) PNG только если нужен OCR/просмотр
+│   │       └── images/                  # (Лениво) Вырезанные формулы/таблицы
+│   ├── storage/
+│   │   ├── library.db                   # SQLite (документы, чанки, история, FTS5)
+│   │   └── chroma/                      # Персистентное хранилище ChromaDB
+│   ├── cache/
+│   │   └── ocr/                         # Кэш распознавания (hash файла → текст)
+│   ├── backups/                         # Архивы, созданные через SQLite Backup API
+│   └── logs/
+│       ├── app.log                      # Ротируемые логи (loguru)
+│       └── ingestion.log
+│
+├── src/
+│   ├── __init__.py
+│   │
+│   ├── core/                            # Этап 1: Ядро и конфигурация
+│   │   ├── __init__.py
+│   │   ├── application.py               # Composition root: сборка всех сервисов
+│   │   ├── settings.py                  # Dataclass-настройки из config.yaml
+│   │   ├── paths.py                     # Управление путями (platformdirs + относительные)
+│   │   ├── exceptions.py                # LamaLocaError, DocumentParseError, IndexSyncError
+│   │   └── events.py                    # События для UI (прогресс импорта, ошибки)
+│   │
+│   ├── ingestion/                       # Этап 2: Загрузка и парсинг
+│   │   ├── __init__.py
+│   │   ├── models.py                    # ParsedDocument, DocumentBlock, IngestionStatus
+│   │   ├── document_router.py           # Маршрутизация по расширению файла
+│   │   ├── base_parser.py               # Абстрактный интерфейс парсера
+│   │   ├── pdf_parser.py                # PyMuPDF: текст + координаты (без рендера PNG по умолчанию)
+│   │   ├── epub_parser.py               # EbookLib: главы, оглавление (chapter вместо page_number)
+│   │   ├── fb2_parser.py                # lxml + BeautifulSoup: извлечение текста FB2
+│   │   ├── djvu_parser.py               # subprocess: djvutxt (текст) + ddjvu (только при необходимости)
+│   │   ├── text_parser.py               # TXT / Markdown с автоопределением кодировки
+│   │   ├── image_ocr.py                 # pytesseract (вызывается только как fallback)
+│   │   ├── calibre_converter.py         # subprocess: ebook-convert (FB2/MOBI → EPUB)
+│   │   ├── page_renderer.py             # Ленивый рендер страниц в PNG (только по запросу/для OCR)
+│   │   └── ocr_fallback.py              # Логика: если текстовый слой пуст → запускаем OCR
+│   │
+│   ├── processing/                      # Этап 3: Очистка и чанкинг
+│   │   ├── __init__.py
+│   │   ├── text_cleaner.py              # Удаление шума OCR, нормализация переносов
+│   │   ├── language_detector.py         # Определение RU/EN для корректного поиска
+│   │   ├── chunker.py                   # Базовый чанкинг (target_tokens, overlap из config)
+│   │   ├── structure_aware_chunker.py   # Сохранение границ заголовков, формул, кода
+│   │   ├── metadata_extractor.py        # Извлечение title/author из метаданных файла
+│   │   └── deduplicator.py              # SHA-256: предотвращение дублирования при повторном импорте
+│   │
+│   ├── embeddings/                      # Этап 4: Векторизация
+│   │   ├── __init__.py
+│   │   └── ollama_embedder.py           # HTTP POST /api/embed → nomic-embed-text
+│   │
+│   ├── storage/                         # Этап 4: Хранение и гибридный поиск
+│   │   ├── __init__.py
+│   │   ├── schema.sql                   # CREATE TABLE documents, chunks, dialogs + FTS5
+│   │   ├── migrations/
+│   │   │   ├── 001_init.sql
+│   │   │   └── 002_fts5.sql
+│   │   ├── sqlite_store.py              # CRUD, транзакции, WAL-режим, SQLite Backup API
+│   │   ├── fts5_index.py                # Виртуальная таблица FTS5 + триггеры синхронизации
+│   │   ├── chroma_store.py              # Коллекция, upsert, query с метаданными (doc_id, page)
+│   │   ├── hybrid_search.py             # FTS5 + ChromaDB → RRF (Reciprocal Rank Fusion) → top-k
+│   │   ├── filters.py                   # Фильтрация по doc_id, типу блока, языку
+│   │   └── models.py                    # Dataclass: Chunk, SearchResult, DocumentRecord
+│   │
+│   ├── llm/                             # Этап 5: RAG и генерация
+│   │   ├── __init__.py
+│   │   ├── llm_engine.py                # Класс LLMEngine: /api/chat, stream=True, timeout
+│   │   ├── prompt_builder.py            # Системный промпт + контекст + вопрос + ограничения
+│   │   ├── rag_pipeline.py              # Вопрос → Hybrid Search → контекст → Ollama
+│   │   ├── citation_formatter.py        # Преобразование chunk_id в "[1] book.pdf, гл. 3"
+│   │   └── history.py                   # Управление контекстом диалога (ограничение токенов)
+│   │
+│   ├── services/                        # Бизнес-логика (оркестрация слоёв)
+│   │   ├── __init__.py
+│   │   ├── ingestion_service.py         # Конечный автомат: pending → parsing → indexing → ready/failed
+│   │   ├── library_service.py           # Список документов, удаление (каскадное из SQLite+Chroma)
+│   │   ├── search_service.py            # Единый API для гибридного поиска с фильтрами
+│   │   ├── chat_service.py              # RAG + история + форматирование цитат
+│   │   ├── backup_service.py            # SQLite conn.backup() + архивация папки data/
+│   │   ├── health_check.py              # Проверка: Ollama запущена? Модель есть? FTS5 работает?
+│   │   ├── offline_guard.py             # Блокировка внешних запросов, разрешение только 127.0.0.1
+│   │   └── index_repair_service.py      # Поиск и исправление рассогласований SQLite ↔ ChromaDB
+│   │
+│   ├── ui/                              # Этап 6: Flet-интерфейс
+│   │   ├── __init__.py
+│   │   ├── app.py                       # Flet App, навигация, глобальное состояние
+│   │   ├── library_view.py              # Список документов, drag-and-drop загрузка
+│   │   ├── document_view.py             # Просмотр текста + ленивая подгрузка страниц/формулы
+│   │   ├── chat_view.py                 # Чат, стриминг токенов, индикатор "Поиск..."
+│   │   ├── citations_view.py            # Раскрывающиеся карточки источников к ответу
+│   │   ├── settings_view.py             # Настройки моделей, путей, параметров чанкинга
+│   │   ├── widgets/
+│   │   │   ├── file_drop_zone.py
+│   │   │   ├── progress_panel.py        # Отображение статуса импорта и прогресса
+│   │   │   └── status_bar.py            # Индикатор оффлайн-режима, размер БД
+│   │   └── workers/
+│   │       ├── import_worker.py         # Фоновая задача импорта (не блокирует UI)
+│   │       └── chat_worker.py           # Фоновая задача генерации ответа
+│   │
+│   └── utils/
+│       ├── __init__.py
+│       ├── config_loader.py             # Загрузка YAML → Settings + валидация путей
+│       ├── logger.py                    # Настройка loguru с ротацией
+│       ├── file_utils.py                # Безопасные имена файлов, очистка временных файлов
+│       ├── hashing.py                   # SHA-256 для doc_id и дедупликации
+│       ├── subprocess_runner.py         # Единый вызов внешних EXE (Tesseract, Calibre) с таймаутом
+│       └── windows_paths.py             # Корректная обработка кириллицы и пробелов в путях Windows
+│
+├── scripts/                             # Служебные скрипты
+│   ├── verify_installation.py           # Проверка Python 3.12, FTS5, Ollama, внешних EXE
+│   ├── import_library.py                # Пакетный импорт папки с прогресс-баром (tqdm)
+│   ├── rebuild_index.py                 # Пересборка FTS5 и ChromaDB из parsed/ документов
+│   ├── make_backup.py                   # Ручной запуск безопасного бэкапа
+│   └── check_offline.py                 # Тестовый запуск полного цикла с отключённой сетью
+│
+├── tests/
+│   ├── conftest.py                      # Фикстуры: временная БД, mock Ollama, тестовые пути
+│   ├── unit/
+│   │   ├── test_config_loader.py
+│   │   ├── test_document_router.py
+│   │   ├── test_chunker.py              # Проверка preserve_headings, preserve_formulas
+│   │   ├── test_deduplicator.py
+│   │   ├── test_fts5_index.py
+│   │   └── test_citation_formatter.py
+│   ├── integration/
+│   │   ├── test_pdf_to_index.py         # Полный цикл: PDF → чанки → SQLite + Chroma
+│   │   ├── test_epub_to_index.py        # Проверка chapter вместо page_number
+│   │   ├── test_ocr_fallback.py         # Проверка вызова pytesseract при пустом тексте
+│   │   ├── test_rag_pipeline.py         # Mock-ответ Ollama + проверка цитирования
+│   │   ├── test_windows_paths.py        # Импорт файла с кириллицей и пробелами в имени
+│   │   └── test_offline_mode.py         # Запуск RAG при физическом отключении сети
+│   └── fixtures/                        # Тестовые файлы (sample.pdf, sample.fb2, sample.djvu)
+│
+└── docs/
+    ├── architecture.md                  # Схема потоков данных и конечный автомат импорта
+    ├── setup_windows.md                 # Пошаговая установка Ollama, Tesseract, DjVuLibre, Calibre
+    └── prompts.md                       # Системные промпты, оптимизированные для ПМИ

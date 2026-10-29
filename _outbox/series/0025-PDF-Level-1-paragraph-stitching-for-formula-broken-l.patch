@@ -1,0 +1,606 @@
+From 8e0979de594069475ef7cb0a7904129fe297dea0 Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Tue, 27 Oct 2026 09:11:04 +0000
+Subject: [PATCH 25/25] PDF Level 1: paragraph stitching for formula-broken
+ lines
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- _stitch_block(): forced \n inside a block -> spaces (formulas, indices
+  no longer slice sentences into chunks); hyphenation joins without space;
+  whitespace collapse; protective spaces around math invariant glyphs
+  (∀ ∃ ∈ ⊂ ℝ ...) so they never glue to neighboring words.
+- _merge_paragraphs(): re-glues geometric blocks split by PyMuPDF when an
+  inline formula forces a new block (broken sentence + dangling line).
+- E2E verified on synthetic PDF with ∀x ∈ A mid-sentence: one monolithic
+  paragraph, zero raw newlines.
+---
+ ...graph-stitching-for-formula-broken-l.patch | 197 ++++++++++++++++++
+ _outbox/FULL-tree-diff.patch                  | 138 +++++++++---
+ src/ingestion/pdf_parser.py                   | 126 ++++++++---
+ 3 files changed, 402 insertions(+), 59 deletions(-)
+ create mode 100644 _outbox/0001-PDF-Level-1-paragraph-stitching-for-formula-broken-l.patch
+
+diff --git a/_outbox/0001-PDF-Level-1-paragraph-stitching-for-formula-broken-l.patch b/_outbox/0001-PDF-Level-1-paragraph-stitching-for-formula-broken-l.patch
+new file mode 100644
+index 0000000..e43632c
+--- /dev/null
++++ b/_outbox/0001-PDF-Level-1-paragraph-stitching-for-formula-broken-l.patch
+@@ -0,0 +1,197 @@
++From 1d295256bbf4a13eb1c6207adbb7c281a81b9848 Mon Sep 17 00:00:00 2001
++From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
++Date: Tue, 27 Oct 2026 09:11:04 +0000
++Subject: [PATCH] PDF Level 1: paragraph stitching for formula-broken lines
++MIME-Version: 1.0
++Content-Type: text/plain; charset=UTF-8
++Content-Transfer-Encoding: 8bit
++
++- _stitch_block(): forced \n inside a block -> spaces (formulas, indices
++  no longer slice sentences into chunks); hyphenation joins without space;
++  whitespace collapse; protective spaces around math invariant glyphs
++  (∀ ∃ ∈ ⊂ ℝ ...) so they never glue to neighboring words.
++- _merge_paragraphs(): re-glues geometric blocks split by PyMuPDF when an
++  inline formula forces a new block (broken sentence + dangling line).
++- E2E verified on synthetic PDF with ∀x ∈ A mid-sentence: one monolithic
++  paragraph, zero raw newlines.
++---
++ src/ingestion/pdf_parser.py | 126 ++++++++++++++++++++++++++++--------
++ 1 file changed, 99 insertions(+), 27 deletions(-)
++
++diff --git a/src/ingestion/pdf_parser.py b/src/ingestion/pdf_parser.py
++index 899ceda..a7da8d0 100644
++--- a/src/ingestion/pdf_parser.py
+++++ b/src/ingestion/pdf_parser.py
++@@ -189,39 +189,37 @@ class PDFParser(BaseParser):
++     def _extract_page_blocks(self, page: pymupdf.Page, page_num: int, start_block_id: int) -> list:
++         """Извлекает блоки со страницы в РЕЖИМЕ БЛОЧНОЙ СБОРКИ (Level 1 ТЗ).
++ 
++-        FIX (разрыв формул и индексов): раньше использовался dict-обход с
++-        TEXT_PRESERVE_WHITESPACE, где each span жил отдельно — верхние/нижние
++-        индексы и разнесённые по baseline фрагменты формул PyMuPDF резал на
++-        отдельные «строки», которые затем склеивались в кашу. Теперь страница
++-        собирается методом get_text("blocks") — фреймворк сам группирует
++-        строки в логические текстовые блоки по геометрической близости, и
++-        формула остаётся монолитной.
++-
++-        Если блок содержит встроенную сложную графику (изображения-формулы,
++-        type==1) или его текст не читается (OCR-мусор/сплющенные формулы),
++-        активируется ленивый рендер зоны блока в PNG через page_renderer
++-        (src/ingestion/page_renderer.py) — как заложено архитектурой проекта.
+++        Пайплайн извлечения (универсальный, для Математики/Физики/Кода):
+++        1. page.get_text("blocks", TEXT_PRESERVE_WHITESPACE) — структурная
+++           группировка строк по геометрии страницы.
+++        2. _merge_paragraphs() — доклейка блоков-продолжений: если PyMuPDF
+++           разбил один абзац на несколько геометрических блоков (висячая
+++           последняя строка, обрыв перед встроенной формулой), они
+++           объединяются обратно в единый логический абзац.
+++        3. _stitch_block() — нормализация: принудительные \n внутри блока
+++           (возникают из-за встроенных формул, ∀/∃/∈, индексов) заменяются
+++           пробелами; дефисные переносы слов склеиваются; математические
+++           глифы получают защитные пробели и не слипаются со словами.
+++        4. Ленивый PNG (page_renderer) — для зон со сплющенной графикой.
++         """
++-        blocks = []
++-        # --- Level 1: блочная сборка вместо span-level dict-обхода ---
++         raw_blocks = page.get_text("blocks", flags=pymupdf.TEXT_PRESERVE_WHITESPACE)
+++        # tuple -> list, отбрасываем чисто графические блоки (type==1).
+++        parsed = [list(rb)[:7] for rb in raw_blocks if rb[6] != 1 and (rb[4] or "").strip()]
+++        merged = self._merge_paragraphs(parsed)
++         img_zones = self._image_zones(page)
++ 
++-        for block_idx, rb in enumerate(raw_blocks):
++-            # rb: (x0, y0, x1, y1, text, block_no, block_type)
++-            x0, y0, x1, y1, text, _bno, btype = rb[:7]
++-            if btype == 1:  # чистое изображение — зона обработана ниже
++-                continue
++-
++-            block_text = re.sub(r"\n{3,}", "\n\n", (text or "").strip())
+++        blocks = []
+++        for idx, mb in enumerate(merged):
+++            x0, y0, x1, y1, text, _bno, _btype = mb
+++            block_text = self._stitch_block(text or "")
++             if not block_text:
++                 continue
++ 
++             coordinates = {"x0": round(x0, 2), "y0": round(y0, 2),
++                            "x1": round(x1, 2), "y1": round(y1, 2)}
++ 
++-            # Блочный режим даёт группы строк; заголовок — короткий блок с
++-            # большой высотой строки (эвристика bbox вместо span.size).
+++            # Заголовок — короткий блок с большой высотой строки
+++            # (эвристика bbox вместо span.size).
++             block_type = self._classify_bbox_block(block_text, y1 - y0)
++ 
++             method = "pymupdf_blocks"
++@@ -229,12 +227,12 @@ class PDFParser(BaseParser):
++             # Сложная графика/формулы внутри или рядом с блоком → ленивый PNG.
++             if self._block_has_math_garbage(block_text) or \
++                     self._zone_intersects(img_zones, (x0, y0, x1, y1)):
++-                zone_png = self._render_zone_lazy(page, (x0, y0, x1, y1), page_num, block_idx)
+++                zone_png = self._render_zone_lazy(page, (x0, y0, x1, y1), page_num, idx)
++                 if zone_png is not None:
++                     method = "pymupdf_blocks+zone_png"
++ 
++             blocks.append(DocumentBlock(
++-                block_id=f"b{start_block_id + block_idx}",
+++                block_id=f"b{start_block_id + idx}",
++                 block_type=block_type,
++                 text=block_text,
++                 page_number=page_num + 1,
++@@ -245,7 +243,7 @@ class PDFParser(BaseParser):
++                 # PNG-копия «каши» идёт отдельным блоком: векторный поиск
++                 # по тексту остаётся, а зрительный слой доступен viewer'у.
++                 blocks.append(DocumentBlock(
++-                    block_id=f"b{start_block_id + block_idx}z",
+++                    block_id=f"b{start_block_id + idx}z",
++                     block_type=BlockType.FIGURE,
++                     text="",
++                     page_number=page_num + 1,
++@@ -254,9 +252,83 @@ class PDFParser(BaseParser):
++                 ))
++         return blocks
++ 
+++    @staticmethod
+++    def _ends_like_paragraph(text: str) -> bool:
+++        """Текст блока выглядит завершённым (абзац можно не доклеивать)."""
+++        t = (text or "").rstrip()
+++        if not t:
+++            return True
+++        return t[-1] in ".!?:;…\"'»)]}$"
+++
+++    @classmethod
+++    def _merge_paragraphs(cls, items: list) -> list:
+++        """Доклейка геометрических блоков в логические абзацы.
+++
+++        Правила объединения соседних текстовых блоков:
+++        * вертикальный зазор < ~1.5 максимальных высот строк (тот же абзац);
+++        * предыдущий блок НЕ заканчивается знаком препинания — он обван на
+++          середине предложения (типично, когда встроенная формула или индекс
+++          заставили PyMuPDF открыть новый геометрический блок);
+++        * горизонтальные границы сопоставимы (тот же столбец) либо следую-
+++          щий блок — «висячая» короткая строка абзаца.
+++        """
+++        if len(items) < 2:
+++            return items
+++        # Сортировка по порядку чтения: сверху вниз, слева направо.
+++        items = sorted(items, key=lambda r: (round(r[1], 1), round(r[0], 1)))
+++        merged = [items[0]]
+++        for cur in items[1:]:
+++            prev = merged[-1]
+++            prev_h = max(prev[3] - prev[1], 1.0)
+++            cur_h = max(cur[3] - cur[1], 1.0)
+++            gap = cur[1] - prev[3]
+++            same_column = (min(prev[2], cur[2]) - max(prev[0], cur[0])) > 0.5 * min(
+++                prev[2] - prev[0], cur[2] - cur[0])
+++            dangling = (cur[2] - cur[0]) < 0.6 * max(prev[2] - prev[0], 1.0)
+++            breakable = not cls._ends_like_paragraph(prev[4])
+++            if gap < 1.5 * max(prev_h, cur_h) and breakable and (same_column or dangling):
+++                merged[-1] = [min(prev[0], cur[0]), min(prev[1], cur[1]),
+++                              max(prev[2], cur[2]), max(prev[3], cur[3]),
+++                              prev[4].rstrip() + "\n" + cur[4].lstrip(),
+++                              prev[5], prev[6]]
+++            else:
+++                merged.append(cur)
+++        return merged
+++
++     # ------------------------------------------------------------------
++-    # Level 1 helpers: геометрия изображений, детект «каши», ленивый PNG
+++    # Level 1 helpers: склейка разрывов, инварианты формул, геометрия
++     # ------------------------------------------------------------------
+++    # Математические инварианты: символы, которые не должны слипаться с
+++    # соседними словами после склейки строк (голые Unicode-глифы).
+++    _MATH_INVARIANTS = "∀∃∈∉⊂⊆⊇∪∩∅→⇒⇔ℝℕℤℚℂ×±≤≥≠≈∑∏∫√∞∧∨¬∪̸"
+++
+++    @classmethod
+++    def _stitch_block(cls, raw_text: str) -> str:
+++        """Склеивает принудительные переносы внутри текстового блока PDF.
+++
+++        Правила:
+++        1. Дефисный перенос слова ("функ-\nция") -> склейка без пробела.
+++        2. Все остальные \\n -> одиночный пробел (формулы и индексы больше
+++           не рвут предложение на куски).
+++        3. Избыточные пробелы схлопываются (" ".join(split())).
+++        4. Математические инварианты получают защитные пробели с обеих
+++           сторон, если парсер извлёк их вплотную к словам/скобкам.
+++        """
+++        text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+++        # 1. Мягкий дефисный перенос: буква + '-' + перевод строки + буква.
+++        text = re.sub(r"(?<=[\w])(-\n)(?=[\w])", "", text)
+++        # 2. Принудительные переносы строк -> пробелы.
+++        text = text.replace("\n", " ")
+++        # 3. Схлопывание пробельного шума.
+++        text = " ".join(text.split())
+++        # 4. Защитные пробели вокруг математических глифов-инвариантов.
+++        for sym in cls._MATH_INVARIANTS:
+++            esc = re.escape(sym)
+++            # прижимаем к символам, которые не являются пробелом/матем. знаком
+++            text = re.sub(rf"(?<=[^\s{esc}])(?={esc})", " ", text)
+++            text = re.sub(rf"(?<={esc})(?=[^\s{esc}])", " ", text)
+++        return " ".join(text.split()).strip()
+++
++     @staticmethod
++     def _image_zones(page: pymupdf.Page) -> list:
++         """Прямоугольники встроенных изображений на странице (для пересечений)."""
++-- 
++2.39.5
++
+diff --git a/_outbox/FULL-tree-diff.patch b/_outbox/FULL-tree-diff.patch
+index 407dc47..74e3e75 100644
+--- a/_outbox/FULL-tree-diff.patch
++++ b/_outbox/FULL-tree-diff.patch
+@@ -266,42 +266,44 @@ index 0000000..411ab5a
+ +        logger.debug(f"PNG страницы не выполнен: {e}")
+ +        return None
+ diff --git a/src/ingestion/pdf_parser.py b/src/ingestion/pdf_parser.py
+-index 643658f..899ceda 100644
++index 643658f..a7da8d0 100644
+ --- a/src/ingestion/pdf_parser.py
+ +++ b/src/ingestion/pdf_parser.py
+-@@ -187,31 +187,141 @@ class PDFParser(BaseParser):
++@@ -187,31 +187,213 @@ class PDFParser(BaseParser):
+          return blocks, page_texts
+  
+      def _extract_page_blocks(self, page: pymupdf.Page, page_num: int, start_block_id: int) -> list:
+ -        """Извлекает блоки со страницы (стандартная логика)."""
+ +        """Извлекает блоки со страницы в РЕЖИМЕ БЛОЧНОЙ СБОРКИ (Level 1 ТЗ).
+ +
+-+        FIX (разрыв формул и индексов): раньше использовался dict-обход с
+-+        TEXT_PRESERVE_WHITESPACE, где each span жил отдельно — верхние/нижние
+-+        индексы и разнесённые по baseline фрагменты формул PyMuPDF резал на
+-+        отдельные «строки», которые затем склеивались в кашу. Теперь страница
+-+        собирается методом get_text("blocks") — фреймворк сам группирует
+-+        строки в логические текстовые блоки по геометрической близости, и
+-+        формула остаётся монолитной.
+-+
+-+        Если блок содержит встроенную сложную графику (изображения-формулы,
+-+        type==1) или его текст не читается (OCR-мусор/сплющенные формулы),
+-+        активируется ленивый рендер зоны блока в PNG через page_renderer
+-+        (src/ingestion/page_renderer.py) — как заложено архитектурой проекта.
+++        Пайплайн извлечения (универсальный, для Математики/Физики/Кода):
+++        1. page.get_text("blocks", TEXT_PRESERVE_WHITESPACE) — структурная
+++           группировка строк по геометрии страницы.
+++        2. _merge_paragraphs() — доклейка блоков-продолжений: если PyMuPDF
+++           разбил один абзац на несколько геометрических блоков (висячая
+++           последняя строка, обрыв перед встроенной формулой), они
+++           объединяются обратно в единый логический абзац.
+++        3. _stitch_block() — нормализация: принудительные \n внутри блока
+++           (возникают из-за встроенных формул, ∀/∃/∈, индексов) заменяются
+++           пробелами; дефисные переносы слов склеиваются; математические
+++           глифы получают защитные пробели и не слипаются со словами.
+++        4. Ленивый PNG (page_renderer) — для зон со сплющенной графикой.
+ +        """
+++        raw_blocks = page.get_text("blocks", flags=pymupdf.TEXT_PRESERVE_WHITESPACE)
+++        # tuple -> list, отбрасываем чисто графические блоки (type==1).
+++        parsed = [list(rb)[:7] for rb in raw_blocks if rb[6] != 1 and (rb[4] or "").strip()]
+++        merged = self._merge_paragraphs(parsed)
+++        img_zones = self._image_zones(page)
+++
+          blocks = []
+ -        page_dict = page.get_text("dict", flags=pymupdf.TEXT_PRESERVE_WHITESPACE)
+ -        
+ -        for block_idx, block in enumerate(page_dict.get("blocks", [])):
+ -            if block.get("type") == 1:  # изображение
+-+        # --- Level 1: блочная сборка вместо span-level dict-обхода ---
+-+        raw_blocks = page.get_text("blocks", flags=pymupdf.TEXT_PRESERVE_WHITESPACE)
+-+        img_zones = self._image_zones(page)
+-+
+-+        for block_idx, rb in enumerate(raw_blocks):
+-+            # rb: (x0, y0, x1, y1, text, block_no, block_type)
+-+            x0, y0, x1, y1, text, _bno, btype = rb[:7]
+-+            if btype == 1:  # чистое изображение — зона обработана ниже
+++        for idx, mb in enumerate(merged):
+++            x0, y0, x1, y1, text, _bno, _btype = mb
+++            block_text = self._stitch_block(text or "")
+++            if not block_text:
+                  continue
+ -            
+ -            bbox = block.get("bbox", [0, 0, 0, 0])
+@@ -309,17 +311,14 @@ index 643658f..899ceda 100644
+ -            
+ -            block_text, block_type = self._classify_text_block(block)
+ -            if not block_text.strip():
+-+
+-+            block_text = re.sub(r"\n{3,}", "\n\n", (text or "").strip())
+-+            if not block_text:
+-                 continue
++-                continue
+ -            
+ +
+ +            coordinates = {"x0": round(x0, 2), "y0": round(y0, 2),
+ +                           "x1": round(x1, 2), "y1": round(y1, 2)}
+ +
+-+            # Блочный режим даёт группы строк; заголовок — короткий блок с
+-+            # большой высотой строки (эвристика bbox вместо span.size).
+++            # Заголовок — короткий блок с большой высотой строки
+++            # (эвристика bbox вместо span.size).
+ +            block_type = self._classify_bbox_block(block_text, y1 - y0)
+ +
+ +            method = "pymupdf_blocks"
+@@ -327,12 +326,13 @@ index 643658f..899ceda 100644
+ +            # Сложная графика/формулы внутри или рядом с блоком → ленивый PNG.
+ +            if self._block_has_math_garbage(block_text) or \
+ +                    self._zone_intersects(img_zones, (x0, y0, x1, y1)):
+-+                zone_png = self._render_zone_lazy(page, (x0, y0, x1, y1), page_num, block_idx)
+++                zone_png = self._render_zone_lazy(page, (x0, y0, x1, y1), page_num, idx)
+ +                if zone_png is not None:
+ +                    method = "pymupdf_blocks+zone_png"
+ +
+              blocks.append(DocumentBlock(
+-                 block_id=f"b{start_block_id + block_idx}",
++-                block_id=f"b{start_block_id + block_idx}",
+++                block_id=f"b{start_block_id + idx}",
+                  block_type=block_type,
+                  text=block_text,
+                  page_number=page_num + 1,
+@@ -344,7 +344,7 @@ index 643658f..899ceda 100644
+ +                # PNG-копия «каши» идёт отдельным блоком: векторный поиск
+ +                # по тексту остаётся, а зрительный слой доступен viewer'у.
+ +                blocks.append(DocumentBlock(
+-+                    block_id=f"b{start_block_id + block_idx}z",
+++                    block_id=f"b{start_block_id + idx}z",
+ +                    block_type=BlockType.FIGURE,
+ +                    text="",
+ +                    page_number=page_num + 1,
+@@ -353,9 +353,83 @@ index 643658f..899ceda 100644
+ +                ))
+          return blocks
+  
+++    @staticmethod
+++    def _ends_like_paragraph(text: str) -> bool:
+++        """Текст блока выглядит завершённым (абзац можно не доклеивать)."""
+++        t = (text or "").rstrip()
+++        if not t:
+++            return True
+++        return t[-1] in ".!?:;…\"'»)]}$"
+++
+++    @classmethod
+++    def _merge_paragraphs(cls, items: list) -> list:
+++        """Доклейка геометрических блоков в логические абзацы.
+++
+++        Правила объединения соседних текстовых блоков:
+++        * вертикальный зазор < ~1.5 максимальных высот строк (тот же абзац);
+++        * предыдущий блок НЕ заканчивается знаком препинания — он обван на
+++          середине предложения (типично, когда встроенная формула или индекс
+++          заставили PyMuPDF открыть новый геометрический блок);
+++        * горизонтальные границы сопоставимы (тот же столбец) либо следую-
+++          щий блок — «висячая» короткая строка абзаца.
+++        """
+++        if len(items) < 2:
+++            return items
+++        # Сортировка по порядку чтения: сверху вниз, слева направо.
+++        items = sorted(items, key=lambda r: (round(r[1], 1), round(r[0], 1)))
+++        merged = [items[0]]
+++        for cur in items[1:]:
+++            prev = merged[-1]
+++            prev_h = max(prev[3] - prev[1], 1.0)
+++            cur_h = max(cur[3] - cur[1], 1.0)
+++            gap = cur[1] - prev[3]
+++            same_column = (min(prev[2], cur[2]) - max(prev[0], cur[0])) > 0.5 * min(
+++                prev[2] - prev[0], cur[2] - cur[0])
+++            dangling = (cur[2] - cur[0]) < 0.6 * max(prev[2] - prev[0], 1.0)
+++            breakable = not cls._ends_like_paragraph(prev[4])
+++            if gap < 1.5 * max(prev_h, cur_h) and breakable and (same_column or dangling):
+++                merged[-1] = [min(prev[0], cur[0]), min(prev[1], cur[1]),
+++                              max(prev[2], cur[2]), max(prev[3], cur[3]),
+++                              prev[4].rstrip() + "\n" + cur[4].lstrip(),
+++                              prev[5], prev[6]]
+++            else:
+++                merged.append(cur)
+++        return merged
+++
+ +    # ------------------------------------------------------------------
+-+    # Level 1 helpers: геометрия изображений, детект «каши», ленивый PNG
+++    # Level 1 helpers: склейка разрывов, инварианты формул, геометрия
+ +    # ------------------------------------------------------------------
+++    # Математические инварианты: символы, которые не должны слипаться с
+++    # соседними словами после склейки строк (голые Unicode-глифы).
+++    _MATH_INVARIANTS = "∀∃∈∉⊂⊆⊇∪∩∅→⇒⇔ℝℕℤℚℂ×±≤≥≠≈∑∏∫√∞∧∨¬∪̸"
+++
+++    @classmethod
+++    def _stitch_block(cls, raw_text: str) -> str:
+++        """Склеивает принудительные переносы внутри текстового блока PDF.
+++
+++        Правила:
+++        1. Дефисный перенос слова ("функ-\nция") -> склейка без пробела.
+++        2. Все остальные \\n -> одиночный пробел (формулы и индексы больше
+++           не рвут предложение на куски).
+++        3. Избыточные пробелы схлопываются (" ".join(split())).
+++        4. Математические инварианты получают защитные пробели с обеих
+++           сторон, если парсер извлёк их вплотную к словам/скобкам.
+++        """
+++        text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+++        # 1. Мягкий дефисный перенос: буква + '-' + перевод строки + буква.
+++        text = re.sub(r"(?<=[\w])(-\n)(?=[\w])", "", text)
+++        # 2. Принудительные переносы строк -> пробелы.
+++        text = text.replace("\n", " ")
+++        # 3. Схлопывание пробельного шума.
+++        text = " ".join(text.split())
+++        # 4. Защитные пробели вокруг математических глифов-инвариантов.
+++        for sym in cls._MATH_INVARIANTS:
+++            esc = re.escape(sym)
+++            # прижимаем к символам, которые не являются пробелом/матем. знаком
+++            text = re.sub(rf"(?<=[^\s{esc}])(?={esc})", " ", text)
+++            text = re.sub(rf"(?<={esc})(?=[^\s{esc}])", " ", text)
+++        return " ".join(text.split()).strip()
+++
+ +    @staticmethod
+ +    def _image_zones(page: pymupdf.Page) -> list:
+ +        """Прямоугольники встроенных изображений на странице (для пересечений)."""
+diff --git a/src/ingestion/pdf_parser.py b/src/ingestion/pdf_parser.py
+index 899ceda..a7da8d0 100644
+--- a/src/ingestion/pdf_parser.py
++++ b/src/ingestion/pdf_parser.py
+@@ -189,39 +189,37 @@ class PDFParser(BaseParser):
+     def _extract_page_blocks(self, page: pymupdf.Page, page_num: int, start_block_id: int) -> list:
+         """Извлекает блоки со страницы в РЕЖИМЕ БЛОЧНОЙ СБОРКИ (Level 1 ТЗ).
+ 
+-        FIX (разрыв формул и индексов): раньше использовался dict-обход с
+-        TEXT_PRESERVE_WHITESPACE, где each span жил отдельно — верхние/нижние
+-        индексы и разнесённые по baseline фрагменты формул PyMuPDF резал на
+-        отдельные «строки», которые затем склеивались в кашу. Теперь страница
+-        собирается методом get_text("blocks") — фреймворк сам группирует
+-        строки в логические текстовые блоки по геометрической близости, и
+-        формула остаётся монолитной.
+-
+-        Если блок содержит встроенную сложную графику (изображения-формулы,
+-        type==1) или его текст не читается (OCR-мусор/сплющенные формулы),
+-        активируется ленивый рендер зоны блока в PNG через page_renderer
+-        (src/ingestion/page_renderer.py) — как заложено архитектурой проекта.
++        Пайплайн извлечения (универсальный, для Математики/Физики/Кода):
++        1. page.get_text("blocks", TEXT_PRESERVE_WHITESPACE) — структурная
++           группировка строк по геометрии страницы.
++        2. _merge_paragraphs() — доклейка блоков-продолжений: если PyMuPDF
++           разбил один абзац на несколько геометрических блоков (висячая
++           последняя строка, обрыв перед встроенной формулой), они
++           объединяются обратно в единый логический абзац.
++        3. _stitch_block() — нормализация: принудительные \n внутри блока
++           (возникают из-за встроенных формул, ∀/∃/∈, индексов) заменяются
++           пробелами; дефисные переносы слов склеиваются; математические
++           глифы получают защитные пробели и не слипаются со словами.
++        4. Ленивый PNG (page_renderer) — для зон со сплющенной графикой.
+         """
+-        blocks = []
+-        # --- Level 1: блочная сборка вместо span-level dict-обхода ---
+         raw_blocks = page.get_text("blocks", flags=pymupdf.TEXT_PRESERVE_WHITESPACE)
++        # tuple -> list, отбрасываем чисто графические блоки (type==1).
++        parsed = [list(rb)[:7] for rb in raw_blocks if rb[6] != 1 and (rb[4] or "").strip()]
++        merged = self._merge_paragraphs(parsed)
+         img_zones = self._image_zones(page)
+ 
+-        for block_idx, rb in enumerate(raw_blocks):
+-            # rb: (x0, y0, x1, y1, text, block_no, block_type)
+-            x0, y0, x1, y1, text, _bno, btype = rb[:7]
+-            if btype == 1:  # чистое изображение — зона обработана ниже
+-                continue
+-
+-            block_text = re.sub(r"\n{3,}", "\n\n", (text or "").strip())
++        blocks = []
++        for idx, mb in enumerate(merged):
++            x0, y0, x1, y1, text, _bno, _btype = mb
++            block_text = self._stitch_block(text or "")
+             if not block_text:
+                 continue
+ 
+             coordinates = {"x0": round(x0, 2), "y0": round(y0, 2),
+                            "x1": round(x1, 2), "y1": round(y1, 2)}
+ 
+-            # Блочный режим даёт группы строк; заголовок — короткий блок с
+-            # большой высотой строки (эвристика bbox вместо span.size).
++            # Заголовок — короткий блок с большой высотой строки
++            # (эвристика bbox вместо span.size).
+             block_type = self._classify_bbox_block(block_text, y1 - y0)
+ 
+             method = "pymupdf_blocks"
+@@ -229,12 +227,12 @@ class PDFParser(BaseParser):
+             # Сложная графика/формулы внутри или рядом с блоком → ленивый PNG.
+             if self._block_has_math_garbage(block_text) or \
+                     self._zone_intersects(img_zones, (x0, y0, x1, y1)):
+-                zone_png = self._render_zone_lazy(page, (x0, y0, x1, y1), page_num, block_idx)
++                zone_png = self._render_zone_lazy(page, (x0, y0, x1, y1), page_num, idx)
+                 if zone_png is not None:
+                     method = "pymupdf_blocks+zone_png"
+ 
+             blocks.append(DocumentBlock(
+-                block_id=f"b{start_block_id + block_idx}",
++                block_id=f"b{start_block_id + idx}",
+                 block_type=block_type,
+                 text=block_text,
+                 page_number=page_num + 1,
+@@ -245,7 +243,7 @@ class PDFParser(BaseParser):
+                 # PNG-копия «каши» идёт отдельным блоком: векторный поиск
+                 # по тексту остаётся, а зрительный слой доступен viewer'у.
+                 blocks.append(DocumentBlock(
+-                    block_id=f"b{start_block_id + block_idx}z",
++                    block_id=f"b{start_block_id + idx}z",
+                     block_type=BlockType.FIGURE,
+                     text="",
+                     page_number=page_num + 1,
+@@ -254,9 +252,83 @@ class PDFParser(BaseParser):
+                 ))
+         return blocks
+ 
++    @staticmethod
++    def _ends_like_paragraph(text: str) -> bool:
++        """Текст блока выглядит завершённым (абзац можно не доклеивать)."""
++        t = (text or "").rstrip()
++        if not t:
++            return True
++        return t[-1] in ".!?:;…\"'»)]}$"
++
++    @classmethod
++    def _merge_paragraphs(cls, items: list) -> list:
++        """Доклейка геометрических блоков в логические абзацы.
++
++        Правила объединения соседних текстовых блоков:
++        * вертикальный зазор < ~1.5 максимальных высот строк (тот же абзац);
++        * предыдущий блок НЕ заканчивается знаком препинания — он обван на
++          середине предложения (типично, когда встроенная формула или индекс
++          заставили PyMuPDF открыть новый геометрический блок);
++        * горизонтальные границы сопоставимы (тот же столбец) либо следую-
++          щий блок — «висячая» короткая строка абзаца.
++        """
++        if len(items) < 2:
++            return items
++        # Сортировка по порядку чтения: сверху вниз, слева направо.
++        items = sorted(items, key=lambda r: (round(r[1], 1), round(r[0], 1)))
++        merged = [items[0]]
++        for cur in items[1:]:
++            prev = merged[-1]
++            prev_h = max(prev[3] - prev[1], 1.0)
++            cur_h = max(cur[3] - cur[1], 1.0)
++            gap = cur[1] - prev[3]
++            same_column = (min(prev[2], cur[2]) - max(prev[0], cur[0])) > 0.5 * min(
++                prev[2] - prev[0], cur[2] - cur[0])
++            dangling = (cur[2] - cur[0]) < 0.6 * max(prev[2] - prev[0], 1.0)
++            breakable = not cls._ends_like_paragraph(prev[4])
++            if gap < 1.5 * max(prev_h, cur_h) and breakable and (same_column or dangling):
++                merged[-1] = [min(prev[0], cur[0]), min(prev[1], cur[1]),
++                              max(prev[2], cur[2]), max(prev[3], cur[3]),
++                              prev[4].rstrip() + "\n" + cur[4].lstrip(),
++                              prev[5], prev[6]]
++            else:
++                merged.append(cur)
++        return merged
++
+     # ------------------------------------------------------------------
+-    # Level 1 helpers: геометрия изображений, детект «каши», ленивый PNG
++    # Level 1 helpers: склейка разрывов, инварианты формул, геометрия
+     # ------------------------------------------------------------------
++    # Математические инварианты: символы, которые не должны слипаться с
++    # соседними словами после склейки строк (голые Unicode-глифы).
++    _MATH_INVARIANTS = "∀∃∈∉⊂⊆⊇∪∩∅→⇒⇔ℝℕℤℚℂ×±≤≥≠≈∑∏∫√∞∧∨¬∪̸"
++
++    @classmethod
++    def _stitch_block(cls, raw_text: str) -> str:
++        """Склеивает принудительные переносы внутри текстового блока PDF.
++
++        Правила:
++        1. Дефисный перенос слова ("функ-\nция") -> склейка без пробела.
++        2. Все остальные \\n -> одиночный пробел (формулы и индексы больше
++           не рвут предложение на куски).
++        3. Избыточные пробелы схлопываются (" ".join(split())).
++        4. Математические инварианты получают защитные пробели с обеих
++           сторон, если парсер извлёк их вплотную к словам/скобкам.
++        """
++        text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
++        # 1. Мягкий дефисный перенос: буква + '-' + перевод строки + буква.
++        text = re.sub(r"(?<=[\w])(-\n)(?=[\w])", "", text)
++        # 2. Принудительные переносы строк -> пробелы.
++        text = text.replace("\n", " ")
++        # 3. Схлопывание пробельного шума.
++        text = " ".join(text.split())
++        # 4. Защитные пробели вокруг математических глифов-инвариантов.
++        for sym in cls._MATH_INVARIANTS:
++            esc = re.escape(sym)
++            # прижимаем к символам, которые не являются пробелом/матем. знаком
++            text = re.sub(rf"(?<=[^\s{esc}])(?={esc})", " ", text)
++            text = re.sub(rf"(?<={esc})(?=[^\s{esc}])", " ", text)
++        return " ".join(text.split()).strip()
++
+     @staticmethod
+     def _image_zones(page: pymupdf.Page) -> list:
+         """Прямоугольники встроенных изображений на странице (для пересечений)."""
+-- 
+2.39.5
+

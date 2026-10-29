@@ -1,0 +1,376 @@
+From 94d53697f5fdaff7a516f7da640eeae93faac81e Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Mon, 26 Oct 2026 19:01:56 +0000
+Subject: [PATCH 06/25] =?UTF-8?q?FIX=20PDF:=20=D1=82=D0=BE=D0=BA=D0=B5?=
+ =?UTF-8?q?=D0=BD=D0=B8=D0=B7=D0=B0=D1=82=D0=BE=D1=80=20=D1=84=D0=BE=D1=80?=
+ =?UTF-8?q?=D0=BC=D1=83=D0=BB=20=D0=B1=D0=B5=D0=B7=20=D0=B1=D0=B8=D1=82?=
+ =?UTF-8?q?=D0=BE=D0=B3=D0=BE=20lookahead,=20=D0=B8=D0=B7=D0=BE=D0=BB?=
+ =?UTF-8?q?=D1=8F=D1=86=D0=B8=D1=8F=20math=20=D0=B2=20PNG,=20=D0=B4=D0=B5?=
+ =?UTF-8?q?=D0=BA=D0=BB=D0=B0=D1=80=D0=B0=D1=82=D0=B8=D0=B2=D0=BD=D1=8B?=
+ =?UTF-8?q?=D0=B5=20=D1=82=D0=B0=D0=B1=D0=BB=D0=B8=D1=86=D1=8B=20=D0=B6?=
+ =?UTF-8?q?=D1=91=D1=81=D1=82=D0=BA=D0=BE=D0=B9=20=D1=81=D0=B5=D1=82=D0=BA?=
+ =?UTF-8?q?=D0=BE=D0=B9?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/processing/exporter.py | 298 ++++++++++++++++++++++++++++++++++---
+ 1 file changed, 281 insertions(+), 17 deletions(-)
+
+diff --git a/src/processing/exporter.py b/src/processing/exporter.py
+index e54e150..e2af5a5 100644
+--- a/src/processing/exporter.py
++++ b/src/processing/exporter.py
+@@ -199,27 +199,113 @@ def _sanitize_for_pdf(text: str) -> str:
+ # векторный результат) либо, при недоступности matplotlib, юникодом.
+ # ---------------------------------------------------------------------------
+ 
+-_LINE_FORMULA_RE = re.compile(r"\$\$.+?\$\$|(?<!\\)\$(?!\$)[^$\n]+?\$(?!\$)")
+-
++# ТЗ п.1/п.2 (токенизатор): захват $...$ НЕ должен требовать «не-доллар»
++# сразу после закрывающего $ — старый lookahead `(?\$)` ломал разбор смежных
++# блоков («$A$, $B$, $C$», «$x$.$y$») и экранированных формул («\[a,b\]»).
++_INLINE_MATH_RE = re.compile(r"(?<!\\)\$(?!\s*\$)(.+?)(?<!\\)\$", flags=re.DOTALL)
++_DISPLAY_MATH_RE = re.compile(r"\$\$(.+?)\$\$", flags=re.DOTALL)
++
++# «Голые» математические Unicode-символы в тексте ответа (частый вывод мелких
++# LLM без LaTeX-обёртки). fpdf2 не рассчитывает ширину таких глифов в потоке —
++# они тоже изолируются в PNG (ТЗ п.1: прямой запрет write()/cell() для ∀ ∃ ∈ …).
++_BARE_MATH_CHARS = "\u2200\u2203\u2204\u2208\u2209\u220b\u2282\u2286\u2283\u2287" \
++                   "\u222a\u2229\u2205\u2216\u2227\u2228\u00ac\u2192\u21d2\u21d4" \
++                   "\u2190\u2194\u2264\u2265\u2260\u2248\u2261\u221d\u221e\u2211" \
++                   "\u220f\u222b\u221a\u2202\u2207\u2212\u22c5\u00d7\u00f7\u00b1" \
++                   "\u22bb\u22c0\u22c1\u22bf\u22c2\u22c3\u2245\u2243\u2276\u2277" \
++                   "\u2131\u2115\u2124\u211a\u2102\u2135\u2136\u2137\u03b1\u03b2" \
++                   "\u03b3\u03b4\u03b5\u03b6\u03b7\u03b8\u03ba\u03bb\u03bc\u03bd" \
++                   "\u03be\u03c0\u03c1\u03c3\u03c4\u03c5\u03c6\u03c7\u03c8\u03c9" \
++                   "\u0393\u0394\u0398\u039b\u039e\u03a0\u03a3\u03a6\u03a8\u03a9"
++_BARE_MATH_RE = re.compile(rf"[{_BARE_MATH_CHARS}](?:[{_BARE_MATH_CHARS}])?")
++
++
++def _tokenize_line(line: str):
++    """Инлайн-сборщик строк (ТЗ п.2): line -> [('text'|'formula', payload)].
++
++    Порядок: сначала вырезаются $$display$$-блоки, затем $inline$-формулы
++    (экранированные \\$ не трогаются), затем одиночные «голые» math-глифы
++    Unicode. Пустые сегменты отбрасываются.
++    """
++    def _split_plain(text: str):
++        segs = []
++        pos = 0
++        for m in _BARE_MATH_RE.finditer(text):
++            if text[pos:m.start()]:
++                segs.append(("text", text[pos:m.start()]))
++            segs.append(("formula", m.group(0)))
++            pos = m.end()
++        if text[pos:]:
++            segs.append(("text", text[pos:]))
++        return segs
++
++    def _split_inline(text: str):
++        segs = []
++        pos = 0
++        for m in _INLINE_MATH_RE.finditer(text):
++            if text[pos:m.start()]:
++                segs.extend(_split_plain(text[pos:m.start()]))
++            body = m.group(1).strip()
++            if body:
++                segs.append(("formula", body))
++            pos = m.end()
++        if text[pos:]:
++            segs.extend(_split_plain(text[pos:]))
++        return segs
+ 
+-def _split_line_formulas(line: str):
+-    """Разбивает строку на [('text', s) | ('formula', latex)] сегменты."""
+     segs = []
+     pos = 0
+-    for m in _LINE_FORMULA_RE.finditer(line):
++    for m in _DISPLAY_MATH_RE.finditer(line):
+         if line[pos:m.start()]:
+-            segs.append(("text", line[pos:m.start()]))
+-        latex = m.group(0)
+-        if latex.startswith("$$"):
+-            segs.append(("formula", latex[2:-2].strip()))
+-        else:
+-            segs.append(("formula", latex[1:-1].strip()))
++            segs.extend(_split_inline(line[pos:m.start()]))
++        body = m.group(1).strip()
++        if body:
++            segs.append(("formula", body))
+         pos = m.end()
+     if line[pos:]:
+-        segs.append(("text", line[pos:]))
++        segs.extend(_split_inline(line[pos:]))
+     return segs
+ 
+ 
++# Совместимость с прежним именем (использовалось в export_to_pdf до рефакторинга)
++_split_line_formulas = _tokenize_line
++
++
++def _is_table_row(line: str) -> bool:
++    """Признак строки markdown-таблицы: начинается с '|' и содержит >=2 труб."""
++    s = line.strip()
++    return s.startswith("|") and s.count("|") >= 2
++
++
++def _is_table_separator(line: str) -> bool:
++    """'| :--- | ---: |' — разделительная строка markdown-таблицы."""
++    s = line.strip().strip("|")
++    cells = [c.strip() for c in s.split("|")]
++    return bool(cells) and all(re.fullmatch(r":?-{2,}:?", c or "-") for c in cells)
++
++
++def _parse_md_table(lines: list[str]):
++    """Декларативный парсер таблицы (ТЗ п.3): строки -> (headers, rows).
++
++    Первая строка — заголовки колонок; separator-строка ('|---|---|')
++    отбрасывается; строки добиваются до ширины сетки, чтобы в жёсткой
++    координатной сетке fpdf2 не оставалось дыр.
++    """
++    def cells_of(ln: str) -> list[str]:
++        s = ln.strip().strip("|")
++        return [c.strip() for c in s.split("|")]
++
++    headers = cells_of(lines[0])
++    rows = []
++    for ln in lines[1:]:
++        if _is_table_separator(ln):
++            continue
++        row = cells_of(ln)
++        row += [""] * (len(headers) - len(row))
++        rows.append(row[:len(headers)])
++    return headers, rows
++
++
+ class AnswerExporter:
+     """Экспортирует ответы ИИ в различные форматы."""
+ 
+@@ -515,7 +601,8 @@ class AnswerExporter:
+                 for t in tokens:
+                     emit_word(t)
+ 
+-        def emit_formula_image(latex: str, tmp_dir: Path, idx: int):
++        def emit_formula_image(latex: str, tmp_dir: Path, idx: int,
++                               max_h_mm: float = 9.0):
+             """Формула -> PNG 300dpi -> вклейка в текущую позицию строки."""
+             nonlocal eq_render_fail
+             png_path = None
+@@ -539,7 +626,7 @@ class AnswerExporter:
+                 from PIL import Image
+                 with Image.open(png_path) as im:
+                     w_px, h_px = im.size
+-                h_mm = min(9.0, max(3.5, h_px / 300.0 * 25.4))
++                h_mm = min(max_h_mm, max(3.5, h_px / 300.0 * 25.4))
+                 w_mm = w_px / h_px * h_mm
+                 right_limit = pdf.l_margin + max_w
+                 if pdf.get_x() + w_mm > right_limit and \
+@@ -558,6 +645,162 @@ class AnswerExporter:
+                 emit_text_segment(" " + _sanitize_for_pdf(
+                     _latex_to_unicode(latex)) + " ")
+ 
++        def render_cell_content(cell_md: str, x0: float, y0: float,
++                                col_w: float, line_h: float,
++                                font_size: float, bold: bool,
++                                tmp_dir: Path) -> float:
++            """Печатает содержимое ячейки таблицы ВНУТРЬ жёсткой сетки
++            координат (ТЗ п.3) и возвращает итоговую высоту блока (мм).
++
++            Текст переносится по ширине колонки; math-токены вклеиваются
++            мини-картинками, никогда не выходя за границы ячейки — структура
++            таблицы не разрывается, пустых ячеек/чёрных прямоугольников нет.
++            """
++            pdf.set_font("DejaVu", "B" if bold else "", font_size)
++            pad = 1.2
++            avail_w = col_w - 2 * pad
++            x = x0 + pad
++            y = y0 + pad
++            right_limit = x0 + col_w - pad
++            bottom_limit = y0  # для подсчёта высоты
++
++            def new_row():
++                nonlocal x, y
++                x = x0 + pad
++                y += line_h
++
++            plain = re.sub(r"\*\*(.+?)\*\*", r"\1", cell_md)
++            plain = re.sub(r"(?<!\w)\*(.+?)\*(?!\w)", r"\1", plain)
++            plain = re.sub(r"`([^`]+)`", r"\1", plain)
++            for kind, seg in _tokenize_line(plain):
++                if kind == "formula":
++                    png_path = None
++                    try:
++                        pp = renderer.render_formula_inline(seg,
++                                                            color="#000000")
++                        if pp and Path(pp).exists() and \
++                                Path(pp).stat().st_size > 0:
++                            png_path = Path(pp)
++                    except Exception:
++                        png_path = None
++                    if png_path is None:
++                        nonlocal eq_idx
++                        eq_idx += 1
++                        cand = tmp_dir / f"cell_eq_{eq_idx}.png"
++                        if _render_formula_png(seg, cand):
++                            png_path = cand
++                    if png_path is not None:
++                        try:
++                            from PIL import Image
++                            with Image.open(png_path) as im:
++                                w_px, h_px = im.size
++                            h_mm = min(line_h * 1.6,
++                                       max(3.2, h_px / 300.0 * 25.4))
++                            w_mm = w_px / h_px * h_mm
++                            if w_mm > avail_w:          # масштаб в границы
++                                w_mm = avail_w
++                                h_mm = h_px / w_px * w_mm
++                            if x + w_mm > right_limit:
++                                new_row()
++                            pdf.image(str(png_path), x=x, y=y,
++                                      w=w_mm, h=h_mm)
++                            x += w_mm + 0.8
++                            bottom_limit = max(bottom_limit, y + h_mm)
++                            continue
++                        except Exception:
++                            pass
++                    seg_txt = _sanitize_for_pdf(_latex_to_unicode(seg))
++                else:
++                    seg_txt = _sanitize_for_pdf(seg)
++                # текстовые слова — перенос строго по ширине колонки
++                for word in re.findall(r"\S+\s*", seg_txt):
++                    stripped = word.rstrip()
++                    if not stripped:
++                        continue
++                    w = pdf.get_string_width(stripped) + 0.2
++                    if x + w > right_limit and x > x0 + pad + 0.1:
++                        new_row()
++                        w = pdf.get_string_width(stripped) + 0.2
++                    if x + w > right_limit:
++                        # слово шире колонки — режем по глифам
++                        chunk = stripped
++                        while chunk:
++                            cut = len(chunk)
++                            while cut > 1 and \
++                                    pdf.get_string_width(chunk[:cut]) > avail_w:
++                                cut -= max(1, cut // 15)
++                            head, chunk = chunk[:cut], chunk[cut:]
++                            pdf.set_xy(x, y)
++                            pdf.cell(pdf.get_string_width(head) + 0.2,
++                                     line_h, head)
++                            x += pdf.get_string_width(head) + 0.2
++                            bottom_limit = max(bottom_limit, y + line_h)
++                            if chunk:
++                                new_row()
++                        continue
++                    pdf.set_xy(x, y)
++                    pdf.cell(w, line_h, stripped)
++                    x += w
++                    bottom_limit = max(bottom_limit, y + line_h)
++                    if word[len(word.rstrip()):]:  # хвостовой пробел
++                        sp = pdf.get_string_width(" ")
++                        if x + sp <= right_limit:
++                            x += sp
++            return max(line_h, bottom_limit - y0)
++
++        def render_table(block: list[str], tmp_dir: Path):
++            """Декларативный вывод markdown-таблицы жёсткой координатной
++            сеткой (ТЗ п.3): фиксированные колонки, рамка, math как картинки."""
++            headers, rows = _parse_md_table(block)
++            ncols = len(headers)
++            if ncols == 0:
++                return
++            grid_w = max_w
++            col_w = grid_w / ncols
++            line_h = 5.0
++            pdf.set_font("DejaVu", "B", 10)
++
++            def row_height(cells, bold):
++                """Предварительная высота строки = сколько строк наберётся."""
++                pdf.set_font("DejaVu", "B" if bold else "", 10)
++                pad = 1.2
++                avail_w = col_w - 2 * pad
++                max_lines = 1
++                for c in cells:
++                    plain = re.sub(r"\*\*(.+?)\*\*", r"\1", c)
++                    plain = re.sub(r"`([^`]+)`", r"\1", plain)
++                    n, cur = 1, ""
++                    for word in re.findall(r"\S+", plain):
++                        trial = (cur + " " + word).strip()
++                        if pdf.get_string_width(trial) > avail_w and cur:
++                            n += 1
++                            cur = word
++                        else:
++                            cur = trial
++                    max_lines = max(max_lines, n)
++                return max_lines * line_h + 2 * pad
++
++            def draw_row(cells, bold):
++                h = row_height(cells, bold)
++                page_h = pdf.h - pdf.b_margin
++                if pdf.get_y() + h > page_h:      # таблица не рвётся посередине
++                    pdf.add_page()
++                y0 = pdf.get_y()
++                x0 = pdf.l_margin
++                for i, c in enumerate(cells):
++                    cx = x0 + i * col_w
++                    pdf.set_draw_color(60, 60, 60)
++                    pdf.set_line_width(0.2)
++                    pdf.rect(cx, y0, col_w, h)     # жёсткая граница ячейки
++                    render_cell_content(c or "\u2014", cx, y0, col_w,
++                                        line_h, 10, bold, tmp_dir)
++                pdf.set_xy(x0, y0 + h)
++
++            draw_row(headers, bold=True)
++            for r in rows:
++                draw_row(r, bold=False)
++            pdf.ln(2)
++
+         def render_body_line(line: str, tmp_dir: Path):
+             m_head = re.match(r"^(#{1,6})\s+(.*)$", line)
+             if m_head:
+@@ -580,7 +823,7 @@ class AnswerExporter:
+             # только пословный write() + image() в текущей позиции.
+             nonlocal eq_idx
+             has_formula = False
+-            for kind, seg in _split_line_formulas(plain):
++            for kind, seg in _tokenize_line(plain):
+                 if kind == "formula":
+                     has_formula = True
+                     eq_idx += 1
+@@ -595,8 +838,29 @@ class AnswerExporter:
+         pending_space: list = []  # [True] = пробел зарезервирован до flush_line
+         with tempfile.TemporaryDirectory(prefix="lama_eq_") as tmp:
+             tmp_dir = Path(tmp)
+-            for raw_line in body_lines:
+-                render_body_line(raw_line.rstrip(), tmp_dir)
++            i = 0
++            while i < len(body_lines):
++                raw_line = body_lines[i].rstrip()
++                # ТЗ п.3: блок таблицы собираем ЦЕЛИКОМ (идущие подряд строки
++                # с '|') и рисуем декларативной сеткой, а не потоковым текстом
++                if _is_table_row(raw_line):
++                    j = i
++                    block = []
++                    while j < len(body_lines) and _is_table_row(
++                            body_lines[j].rstrip()):
++                        block.append(body_lines[j].rstrip())
++                        j += 1
++                    if len(block) >= 2 and any(_is_table_separator(b)
++                                               for b in block[1:]):
++                        render_table(block, tmp_dir)
++                    else:
++                        # не таблица (одиночная строка с |) — печатаем как текст
++                        for bl in block:
++                            render_body_line(bl, tmp_dir)
++                    i = j
++                    continue
++                render_body_line(raw_line, tmp_dir)
++                i += 1
+             pdf.ln(1)
+         if eq_render_fail:
+             logger.debug(f"PDF: {eq_render_fail} формул отрендерены текстом")
+-- 
+2.39.5
+

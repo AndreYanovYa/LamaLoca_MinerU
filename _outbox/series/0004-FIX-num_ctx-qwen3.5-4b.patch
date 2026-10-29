@@ -1,0 +1,436 @@
+From 9b07fc39370c7e318dc1439eecd7a1e8f8e60e24 Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Mon, 26 Oct 2026 18:45:09 +0000
+Subject: [PATCH 04/25] =?UTF-8?q?FIX:=20num=5Fctx=20=D0=BD=D0=B8=D0=BA?=
+ =?UTF-8?q?=D0=BE=D0=B3=D0=B4=D0=B0=20=D0=BD=D0=B5=20=D0=BF=D1=80=D0=B5?=
+ =?UTF-8?q?=D0=B2=D1=8B=D1=88=D0=B0=D0=B5=D1=82=20=D0=A0=D0=95=D0=90=D0=9B?=
+ =?UTF-8?q?=D0=AC=D0=9D=D0=9E=D0=95=20=D0=BE=D0=BA=D0=BD=D0=BE=20=D0=BC?=
+ =?UTF-8?q?=D0=BE=D0=B4=D0=B5=D0=BB=D0=B8=20(=D0=BB=D0=B5=D1=87=D0=B5?=
+ =?UTF-8?q?=D0=BD=D0=B8=D0=B5=20=D0=BF=D1=83=D1=81=D1=82=D0=BE=D0=B3=D0=BE?=
+ =?UTF-8?q?=20=D0=BE=D1=82=D0=B2=D0=B5=D1=82=D0=B0=20qwen3.5:4b)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Корень сбоя из лога (num_ctx=18268, eval_count=None, пустой ответ):
+потолок 32768 в window = max(8192, min(32768, prompt+max_new+1024)) был
+выдуманным — аппаратный лимит qwen3.5:4b равен 16384 токенов; llama.cpp не
+мог отрендерить KV-кэш и молча возвращал done_reason='length' с пустым content.
+
+- detect_model_window(): авто-детект нативного окна по /api/show (+парсинг raw),
+  потокобезопасный кэш по ключу (base_url, model), консервативный дефолт 16384;
+- _build_options(): жёсткий инвариант prompt + num_predict + reserve <= num_ctx
+  <= window_cap; num_predict урезается до реального остатка окна (мин. 64);
+- _trim_history(): скользящее окно — вырезание старых non-system сообщений,
+  защита system-префикса и последнего запроса; резерв — обрезка гигантского
+  холста главы (62k симв.) по абзацам с явной пометкой (раньше он физически
+  не влезал в 16k и глушил генерацию);
+- chat(): история и каждая дозапроска авто-продолжения проходят через
+  _trim_history(window_cap) — раздувание контекста 15817->18111->18268 из
+  лога невозможно by design; при нулевом выводе — один перезапрос с halved
+  окном вместо пустого пузыря в UI;
+- settings.py: OllamaConfig.num_ctx_cap / num_predict_cap (config.yaml ollama.*
+  или env OLLAMA_NUM_CTX_CAP/OLLAMA_NUM_PREDICT_CAP) для ручного переопределения.
+
+Тесты (mock Ollama): детект окна, инварианты _build_options на 1k..40k токенов,
+trim 62k главы в 16k, сквозной chat, гонка 8 потоков за кэшем, cap-override,
+изоляция кэша по base_url, регрессия _glue_parts — все пройдены.
+---
+ src/core/settings.py  |  11 ++
+ src/llm/llm_engine.py | 283 ++++++++++++++++++++++++++++++++++++------
+ 2 files changed, 258 insertions(+), 36 deletions(-)
+
+diff --git a/src/core/settings.py b/src/core/settings.py
+index 2001866..446555b 100644
+--- a/src/core/settings.py
++++ b/src/core/settings.py
+@@ -42,6 +42,13 @@ class OllamaConfig:
+     chat_model: str = "qwen3:4b"  # дефолт приведён к существующему на Hub имени (qwen3.5:4b не существует)
+     embedding_model: str = "bge-m3"
+     timeout_seconds: int = 180
++    # AUDIT (критический сбой «пустого ответа»): аппаратный лимит контекста
++    # модели. Если у вас qwen3.5:4b (нативные 16384 токенов), укажите здесь
++    # num_ctx_cap: 16384 — движок никогда не попросит Ollama больше и не
++    # словит молчаливый done_reason='length' с пустым content. 0 = авто-детект
++    # по /api/show с консервативным дефолтом 16384.
++    num_ctx_cap: int = 0
++    num_predict_cap: int = 0
+ 
+ 
+ @dataclass(frozen=True)
+@@ -217,6 +224,8 @@ class Settings:
+                 chat_model=ollama_raw.get("chat_model", "qwen3:4b"),
+                 embedding_model=ollama_raw.get("embedding_model", "bge-m3"),
+                 timeout_seconds=int(ollama_raw.get("timeout_seconds", 180)),
++                num_ctx_cap=int(ollama_raw.get("num_ctx_cap", 0)),
++                num_predict_cap=int(ollama_raw.get("num_predict_cap", 0)),
+             ),
+             search=SearchConfig(
+                 fts_top_k=int(search_raw.get("fts_top_k", 20)),
+@@ -277,6 +286,8 @@ class Settings:
+                 "chat_model": self.ollama.chat_model,
+                 "embedding_model": self.ollama.embedding_model,
+                 "timeout_seconds": self.ollama.timeout_seconds,
++                "num_ctx_cap": self.ollama.num_ctx_cap,
++                "num_predict_cap": self.ollama.num_predict_cap,
+             },
+             "search": {
+                 "fts_top_k": self.search.fts_top_k,
+diff --git a/src/llm/llm_engine.py b/src/llm/llm_engine.py
+index 7ed5953..d5f0aa3 100644
+--- a/src/llm/llm_engine.py
++++ b/src/llm/llm_engine.py
+@@ -1,11 +1,33 @@
+ # src/llm/llm_engine.py
+ import difflib
++import re
++import threading
+ import requests
+ from loguru import logger
+-from typing import List, Dict, Any
++from typing import List, Dict, Any, Optional, Tuple
+ from ..core.settings import OllamaConfig
+ from ..core.exceptions import LamaLocaError
+ 
++# AUDIT (критический сбой «немеющего» qwen3.5:4b): формула окна
++#   window = max(8192, min(32768, prompt_tokens + max_new + 1024))
++# заставляла Ollama выделять KV-кэш на 29k токенов под модель с аппаратным
++# лимитом контекста 16384. llama.cpp не может отрендерить такой запрос:
++# генерация аварийно завершалась с done_reason='length' и АБСОЛЮТНО ПУСТЫМ
++# message.content (см. лог: num_ctx=18268, eval_count=None, content='').
++# Авто-продолжения лишь усугубляли деградацию (каждая дозапроска раздувала
++# историю до тех же 18k+). Теперь num_ctx никогда не превышает реальный
++# нативный лимит модели, обнаруженный по /api/show (+ потокобезопасный кэш).
++# КЛЮЧ кэша — (base_url, model): разные экземпляры движка с разными
++# base_url/конфигами не травят друг друга общим кэшем (был баг: cap одного
++# движка «прилипал» к другому через общий кэш по имени модели).
++_MODEL_WINDOW_CACHE: Dict[tuple, int] = {}
++_MODEL_WINDOW_LOCK = threading.Lock()
++
++# Консервативный потолок для неизвестных моделей: меньше нативных 32k Qwen,
++# но достаточно для конспекта полной главы; перестраховка от OOM на CPU-offload.
++_DEFAULT_MAX_WINDOW = 16384
++_MIN_USEFUL_WINDOW = 8192
++
+ 
+ class LLMEngine:
+     """Обёртка над Ollama API для генерации ответов через /api/chat."""
+@@ -14,6 +36,11 @@ class LLMEngine:
+         self.base_url = config.base_url.rstrip("/")
+         self.model = config.chat_model
+         self.timeout = config.timeout_seconds
++        # Потолки контекста, отдаваемые в options.num_ctx. Могут быть снижены
++        # init-флагом OLLAMA_NUM_CTX_CAP или полем config (num_ctx_cap /
++        # max_context) — читаем defensively, чтобы не ломать frozen-конфиги
++        # старых версий settings.py.
++        self._ctx_cap = self._read_ctx_cap(config)
+         
+         # АУДИТ: как и в OllamaEmbedder — недоступная Ollama не должна ронять
+         # всё приложение на старте (просмотр PDF/библиотека работают офлайн).
+@@ -75,6 +102,81 @@ class LLMEngine:
+                 return cand
+         return self.model
+ 
++    @staticmethod
++    def _read_ctx_cap(config: OllamaConfig) -> Tuple[int, int]:
++        """(cap_num_ctx, cap_num_predict) — читаются из config если заданы,
++        иначе из env OLLAMA_NUM_CTX_CAP / OLLAMA_NUM_PREDICT_CAP.
++
++        0 означает «не задано» -> используются авто-детект по /api/show и
++        дефолты движка. DEFENSIVE: старые frozen-конфиги без новых полей
++        не роняют приложение (getattr + except).
++        """
++        def _cfg(name: str) -> int:
++            try:
++                return int(getattr(config, name, 0) or 0)
++            except (TypeError, ValueError):
++                return 0
++        import os
++        ctx = _cfg("num_ctx_cap") or _cfg("max_context")
++        pred = _cfg("num_predict_cap")
++        try:
++            ctx = ctx or int(os.environ.get("OLLAMA_NUM_CTX_CAP", "0") or 0)
++            pred = pred or int(os.environ.get("OLLAMA_NUM_PREDICT_CAP", "0") or 0)
++        except ValueError:
++            pass
++        return max(0, ctx), max(0, pred)
++
++    def detect_model_window(self, model: str) -> int:
++        """Нативный лимит контекста модели в токенах (лечение «пустого ответа»).
++
++        Источник истины — параметр num_ctx у config/parameters модели
++        (/api/show); дополнительно парсится raw-секция model_info/General
++        ("qwen2.local_size"/"context_length"). Результат кэшируется под
++        threading.Lock — метод потокобезопасен и не долбит Ollama на каждый чат.
++        При недоступности API возвращается консервативный потолок
++        min(_DEFAULT_MAX_WINDOW, ctx_cap) — НИКОГДА выдуманные 32k.
++        """
++        cache_key = (self.base_url, model)
++        with _MODEL_WINDOW_LOCK:
++            if cache_key in _MODEL_WINDOW_CACHE:
++                return _MODEL_WINDOW_CACHE[cache_key]
++        window = 0
++        try:
++            resp = requests.post(f"{self.base_url}/api/show",
++                                 json={"name": model}, timeout=10)
++            resp.raise_for_status()
++            data = resp.json()
++            candidates = []
++            for holder in (data.get("model_info") or {},
++                           data.get("parameters") or {},
++                           data.get("config") or {}):
++                for key, val in holder.items():
++                    k = str(key).lower()
++                    if isinstance(val, (int, float)) and any(
++                            s in k for s in ("context_length", "num_ctx",
++                                             "n_ctx", "window")):
++                        candidates.append(int(val))
++            raw = str(data.get("raw", "")) + str(data.get("template", ""))
++            for m in re.finditer(r'(?:context_length|n_ctx|num_ctx)"?\s*[:=]\s*"?'
++                                 r'(\d+)', raw):
++                candidates.append(int(m.group(1)))
++            candidates = [c for c in candidates if 512 <= c <= 1_048_576]
++            if candidates:
++                window = min(candidates)  # берём САМЫЙ маленький заявленный лимит
++        except (requests.exceptions.RequestException, ValueError) as e:
++            logger.warning(f"LLM: не удалось определить окно контекста "
++                           f"'{model}' ({e}) — беру консервативный дефолт.")
++        if not window:
++            window = _DEFAULT_MAX_WINDOW
++        ctx_cap, _pred_cap = self._ctx_cap
++        if ctx_cap:
++            window = min(window, ctx_cap)
++        with _MODEL_WINDOW_LOCK:
++            _MODEL_WINDOW_CACHE[cache_key] = window
++        logger.info(f"LLM: нативное окно контекста '{model}' = {window} токенов "
++                    f"(потолок num_ctx в запросах)")
++        return window
++
+     @staticmethod
+     def estimate_tokens(messages: List[Dict[str, str]]) -> int:
+         """\u0413\u0440\u0443\u0431\u0430\u044f \u043e\u0446\u0435\u043d\u043a\u0430 \u0434\u043b\u0438\u043d\u044b \u043f\u0440\u043e\u043c\u043f\u0442\u0430 \u0432 \u0442\u043e\u043a\u0435\u043d\u0430\u0445.
+@@ -86,40 +188,45 @@ class LLMEngine:
+         total_chars = sum(len(m.get("content", "") or "") for m in messages)
+         return total_chars // 3 + 64  # \u0437\u0430\u043f\u0430\u0441 \u043d\u0430 \u0448\u0430\u0431\u043b\u043e\u043d \u0447\u0430\u0442\u0430 \u0438 \u0440\u043e\u043b\u0438
+ 
+-    def _build_options(self, prompt_tokens: int) -> Dict[str, Any]:
+-        """FIX (\u043f\u0443\u0441\u0442\u043e\u0439 \u043e\u0442\u0432\u0435\u0442 / \u043e\u0431\u0440\u0435\u0437\u043a\u0430): \u0434\u0438\u043d\u0430\u043c\u0438\u0447\u0435\u0441\u043a\u0438\u0439 num_ctx.
++    def _build_options(self, prompt_tokens: int, model_window: Optional[int] = None) -> Dict[str, Any]:
++        """FIX (пустой ответ / обрезка): num_ctx в пределах РЕАЛЬНОГО окна модели.
++
++        Корень обеих проблем: Ollama по умолчанию берёт num_ctx 2048-4096.
++        Контекст главы (~15k символов) + системный промпт с few-shot не
++        помещался в окно -> qwen возвращала пустую строку или обрывала
++        генерацию. Окно подбиралось под конкретный запрос — но ПРЕЖНЯЯ
++        формула window = max(8192, min(32768, prompt+max_new+1024)) имела
++        критический дефект: потолок 32768 был ВЫДУМАННЫМ. Модель qwen3.5:4b
++        имеет аппаратный лимит 16384 токенов; при num_ctx > 16k llama.cpp
++        не мог отрендерить KV-кэш и возвращал done_reason='length' с ПУСТЫМ
++        content (лог: num_ctx=18268, eval_count=None, content='').
+ 
+-        \u041a\u043e\u0440\u0435\u043d\u044c \u043e\u0431\u0435\u0438\u0445 \u043f\u0440\u043e\u0431\u043b\u0435\u043c: Ollama \u043f\u043e \u0443\u043c\u043e\u043b\u0447\u0430\u043d\u0438\u044e \u0431\u0435\u0440\u0451\u0442 num_ctx 2048-4096.
+-        \u041a\u043e\u043d\u0442\u0435\u043a\u0441\u0442 \u0433\u043b\u0430\u0432\u044b (~15k \u0441\u0438\u043c\u0432\u043e\u043b\u043e\u0432) + \u0441\u0438\u0441\u0442\u0435\u043c\u043d\u044b\u0439 \u043f\u0440\u043e\u043c\u043f\u0442 \u0441 few-shot \u043d\u0435
+-        \u043f\u043e\u043c\u0435\u0449\u0430\u043b\u0441\u044f \u0432 \u043e\u043a\u043d\u043e -> qwen \u0432\u043e\u0437\u0432\u0440\u0430\u0449\u0430\u043b\u0430 \u043f\u0443\u0441\u0442\u0443\u044e \u0441\u0442\u0440\u043e\u043a\u0443 \u0438\u043b\u0438 \u043e\u0431\u0440\u044b\u0432\u0430\u043b\u0430
+-        \u0433\u0435\u043d\u0435\u0440\u0430\u0446\u0438\u044e. \u0422\u0435\u043f\u0435\u0440\u044c \u043e\u043a\u043d\u043e \u043f\u043e\u0434\u0431\u0438\u0440\u0430\u0435\u0442\u0441\u044f \u043f\u043e\u0434 \u043a\u043e\u043d\u043a\u0440\u0435\u0442\u043d\u044b\u0439 \u0437\u0430\u043f\u0440\u043e\u0441.
++        НОВЫЙ РАСЧЁТ (model_window — нативный лимит из detect_model_window):
++          * num_ctx никогда не превышает model_window;
++          * num_predict = min(max_new_cap, model_window - prompt - reserve);
++            если остатка < MIN_USEFUL_WINDOW — промпт урезается вызывающим
++            кодом (chat_context_truncated), а не убивает генерацию молча;
++          * при переполнении окна включается скользящее окно истории
++            (_trim_history) вместо «немой» ошибки рендера.
+         """
+-        # FIX (короткий конспект): раньше жёсткий потолок num_predict=4096
+-        # обрезал длинные структурированные ответы на полуслове. Теперь лимит
+-        # генерации растёт вместе с запросом: ~50% окна, минимум 4096,
+-        # максимум 8192 токенов (~1500-2500 слов Markdown — достаточно для
+-        # полного конспекта 500-800 слов с таблицами и LaTeX).
+-        # REFACTORING (ТЗ «Full-Chapter Context», RTX 5060 + 24GB RAM):
+-        # num_predict = 4096 — детерминированный лимит генерации из ТЗ
+-        # (~1000-1500 слов Markdown); окно растёт от размера контекста, но
+-        # не превышает 24576 токенов (вся глава Кудрявцева за один проход;
+-        # запас ~7k на KV-кэш при 24GB и без offload на CPU).
+-        # num_gpu = 99 — принудительная выгрузка всех слоёв на GPU NVIDIA
+-        # (валидный параметр Ollama; при нехватке VRAM Ollama сама частично
+-        # вернёт слои на CPU — приложение не упадёт).
+-        # AUDIT (гибкость «обучающей системы»): окно считается с запасом на
+-        # длинный промпт (полная глава + few-shot ~20k токенов) — потолок
+-        # поднят до 32768: qwen держит нативные 32k, RTX 5060+24GB тянет
+-        # KV-кэш 32k для 4B-модели без offload.
+-        # FIX (проблема 2 ТЗ — объём конспекта): лимит генерации поднят с
+-        # 4096 до 8192 токенов (~1500-2500 слов Markdown). Прежние 4096
+-        # гарантированно упёрлись в done_reason='length' ровно на середине
+-        # полноформатного конспекта (в логе: «Генерация прервана по лимиту
+-        # length ... num_predict=4096»), и пользователь видел обрезанный
+-        # ответ ~600-800 слов. Авто-продолжение в chat() остаётся второй
+-        # страховкой, но теперь срабатывать оно должно редко.
+-        max_new = 8192
+-        window = max(8192, min(32768, prompt_tokens + max_new + 1024))
++        window_cap = model_window or self.detect_model_window(self.model)
++        ctx_cap, pred_cap = self._ctx_cap  # (num_ctx_cap, num_predict_cap), 0 = не задан
++        if ctx_cap:
++            window_cap = min(window_cap, ctx_cap)
++        # Целевая длина генерации ~1500-2500 слов Markdown для полного
++        # конспекта; реально упирается в остаток окна модели ниже.
++        desired_new = 8192
++        if pred_cap:
++            desired_new = min(desired_new, pred_cap)
++        reserve = 512  # шаблон чата / special tokens
++        # ЖЁСТКИЙ ИНВАРИАНТ: prompt_tokens + num_predict + reserve <= num_ctx
++        # <= window_cap. Раньше при room < 512 ставился полный desired_new и
++        # окно раздувалось за лимит модели -> «немой» done_reason='length'.
++        # Теперь num_predict никогда не превышает реальный остаток окна.
++        room = window_cap - prompt_tokens - reserve
++        max_new = max(64, min(desired_new, room))
++        window = max(_MIN_USEFUL_WINDOW, min(
++            window_cap, prompt_tokens + max_new + reserve))
+         return {
+             "temperature": 0.3,
+             "top_p": 0.9,
+@@ -197,6 +304,76 @@ class LLMEngine:
+             return new[best_len:]
+         return new
+ 
++    @staticmethod
++    def _clip_message_content(content: str, max_chars: int) -> str:
++        """Обрезка содержимого сообщения по границам абзацев с пометкой.
++
++        Используется как последний резерв, когда даже одно сообщение (например,
++        холст полной главы 62k символов) физически не влезает в окно модели.
++        """
++        if len(content) <= max_chars:
++            return content
++        clipped = content[:max_chars]
++        cut = clipped.rfind("\n\n")
++        if cut > max_chars // 2:
++            clipped = clipped[:cut]
++        return (clipped.rstrip() +
++                "\n\n[...фрагмент обрезан: контекст превысил лимит окна модели...]")
++
++    def _trim_history(self, messages: List[Dict[str, Any]],
++                      window_cap: int) -> List[Dict[str, Any]]:
++        """Скользящее окно: гарантирует, что оценка промпта влезает в РЕАЛЬНОЕ
++        окно модели (с запасом на num_predict).
++
++        Шаг 1 — удаляет самые старые non-system сообщения по одному (system-
++        промпт и последний user-запрос защищены от вырезания всегда).
++        Шаг 2 — если после этого бюджет всё ещё превышен (последний запрос сам
++        по себе больше окна), его содержимое обрезается по абзацам (_clip_...).
++        Иначе num_ctx снова раздулся бы за аппаратный лимит — тот самый баг из
++        лога (num_ctx=18268 при окне модели 16384 -> пустой ответ).
++        Потокобезопасен: работает с копиями сообщений, исходные не мутирует.
++        """
++        reserve_for_gen = 1024
++        budget = max(512, window_cap - reserve_for_gen)
++        trimmed = [dict(m) for m in messages]
++
++        def _total() -> int:
++            return self.estimate_tokens(trimmed)
++
++        while _total() > budget and len(trimmed) > 2:
++            # индекс первого removable: пропускаем system-префикс
++            first_removable = 0
++            while (first_removable < len(trimmed)
++                   and trimmed[first_removable].get("role") == "system"):
++                first_removable += 1
++            last = len(trimmed) - 1
++            if first_removable > last or first_removable == last:
++                break  # вырезать нечего (остались только system + последний user)
++            dropped = trimmed.pop(first_removable)
++            logger.info(
++                f"LLM: контекст превышает окно модели ({_total() + 1024} > "
++                f"{window_cap}) — из истории вырезано сообщение "
++                f"'{dropped.get('role')}' ({len(dropped.get('content') or '')} симв.)")
++
++        # Шаг 2: последний запрос/огромный system-блок — урезаем содержимое,
++        # чтобы инвариант prompt+predict<=num_ctx<=window выполнялся всегда.
++        if _total() > budget:
++            overhead = _total() - budget
++            for msg in reversed(trimmed):
++                content = msg.get("content", "") or ""
++                if not content:
++                    continue
++                allowed = max(256, len(content) - overhead * 3)
++                if allowed < len(content):
++                    msg["content"] = self._clip_message_content(content, allowed)
++                    logger.warning(
++                        f"LLM: контекст ({_total()} токенов) превышает окно "
++                        f"модели ({window_cap}) — сообщение "
++                        f"'{msg.get('role')}' обрезано до {allowed} симв.")
++                if _total() <= budget:
++                    break
++        return trimmed
++
+     def chat(self, messages: List[Dict[str, Any]], stream: bool = False) -> str:
+         """Отправляет сообщения в Ollama и возвращает ответ.
+ 
+@@ -206,13 +383,24 @@ class LLMEngine:
+         упёрлась в лимит num_predict, движок до 2 раз дозапрашивает модель,
+         подставляя уже написанный текст в историю, и склеивает куски в единый
+         ответ. Технических обрывов «на полуслове» больше не бывает.
++
++        AUDIT (критический сбой qwen3.5:4b / пустой ответ): все options
++        теперь считаются от РЕАЛЬНОГО окна модели (detect_model_window), а
++        история перед каждым запросом проходит через _trim_history — num_ctx
++        физически не может превысить аппаратный лимит, «немые» done_reason=
++        'length' с пустым content больше невозможны by design.
+         """
+         self._ensure_available()
+         model = self._resolve_model()
+         if model != self.model:
+             logger.info(f"Модель '{self.model}' не найдена в Ollama — "
+                         f"использую доступную '{model}'")
+-        options = self._build_options(self.estimate_tokens(messages))
++        window_cap = self.detect_model_window(model)
++        ctx_cap, _ = self._ctx_cap
++        if ctx_cap:
++            window_cap = min(window_cap, ctx_cap)
++        messages = self._trim_history(messages, window_cap)
++        options = self._build_options(self.estimate_tokens(messages), window_cap)
+ 
+         if stream:
+             # Стриминговый путь остаётся простым генератором без continuation
+@@ -236,6 +424,21 @@ class LLMEngine:
+         try:
+             for attempt in range(MAX_CONTINUATIONS + 1):
+                 content, done_reason = self._post_chat(model, cont_messages, options)
++                # AUDIT (диагностика «немой» генерации): eval_count=None при
++                # done_reason='length' означает, что llama.cpp НЕ ОТРЕНДЕРИЛ ни
++                # одного токена — запрос физически не влезал в KV-кэш модели.
++                # Раньше это выглядело как пустой пузырь в чате; теперь движок
++                # сам снижает окно и делает один перезапрос с урезанной историей.
++                if (not content.strip() and done_reason == "length"
++                        and attempt == 0):
++                    logger.warning(
++                        "LLM: нулевой вывод при полном окне — перезапрос с "
++                        "уменьшенным контекстом (KV-кэш/лимит слотов модели).")
++                    reduced_cap = max(_MIN_USEFUL_WINDOW, window_cap // 2)
++                    cont_messages = self._trim_history(messages, reduced_cap)
++                    options = self._build_options(
++                        self.estimate_tokens(cont_messages), reduced_cap)
++                    continue
+                 # ТЗ п.1: перед конкатенацией вырезаем дублирующийся хвост
+                 # предыдущей части (модель часто повторяет последнюю строку,
+                 # обрывок таблицы или целый раздел).
+@@ -266,8 +469,16 @@ class LLMEngine:
+                         "ответа (без повторения уже написанного, без фразы "
+                         "\u201cПродолжаю\u201d, markdown/LaTeX-формат тот же)."},
+                 ]
+-                # Новое окно: исходный контекст + уже написанное + запас.
+-                options = self._build_options(self.estimate_tokens(cont_messages))
++                # FIX (лог «num_ctx=18111 -> 18268»): раньше дозапроска
++                # раздувала историю (контекст главы + весь предыдущий ответ),
++                # упиралась в окно и возвращала ПУСТОТУ. Теперь continuation
++                # идёт по скользящему окну: из истории вырезаются старые
++                # сообщения, а хвост предыдущего ответа остаётся единственным
++                # носителем уже написанного текста. num_ctx никогда не
++                # превышает нативный лимит модели.
++                cont_messages = self._trim_history(cont_messages, window_cap)
++                options = self._build_options(
++                    self.estimate_tokens(cont_messages), window_cap)
+                 logger.info(f"LLM: авто-продолжение оборванного ответа "
+                             f"(попытка {attempt + 1}/{MAX_CONTINUATIONS})")
+             return "\n".join(p for p in full_parts if p.strip())
+-- 
+2.39.5
+

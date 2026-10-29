@@ -1,0 +1,29 @@
+From cf717c2627a4be5368cfbc9c3540f78da069cace Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Tue, 27 Oct 2026 08:30:44 +0000
+Subject: [PATCH 7/8] Fix SyntaxWarning in text_cleaner docstring; smoke tests
+ for Levels 1-3 pass (punctured neighborhood, latex->unicode, display-block
+ protection, metadata normalization)
+
+---
+ src/processing/text_cleaner.py | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/processing/text_cleaner.py b/src/processing/text_cleaner.py
+index 8e790e1..34b38ae 100644
+--- a/src/processing/text_cleaner.py
++++ b/src/processing/text_cleaner.py
+@@ -11,8 +11,8 @@
+ Правила замены (эталон ТЗ приведён как示意; здесь — синтаксически корректные
+ Python-regex с тем же смыслом):
+ 
+-    text = re.sub(r'X\s*\\\s*setminus\s+([UO]\(x_0\))', r'x \\\\in \\\\dot{\\1}', text)
+-    text = re.sub(r'X\s*\\\\\s*([UO]\(x_0\))',           r'x \\\\in \\\\dot{\\1}', text)
++    text = re.sub(r"X\\s*\\\\+\\s*setminus\\s+([UO]\\(x_0\\))", r"x \\in \\dot{\\1}", text)
++    text = re.sub(r"X\\s*\\\\+\\s*([UO]\\(x_0\\))",             r"x \\in \\dot{\\1}", text)
+ 
+ Модуль потокобезопасен: только чистые функции над строками, без общего
+ изменяемого состояния (скомпилированные regex неизменяемы).
+-- 
+2.39.5
+

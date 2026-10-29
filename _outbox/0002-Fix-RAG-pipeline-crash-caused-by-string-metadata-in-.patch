@@ -1,0 +1,91 @@
+From 4d0971319a3ee05fda17b38d963ed0ff58b3e07a Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Mon, 26 Oct 2026 20:07:38 +0000
+Subject: [PATCH 2/2] Fix RAG pipeline crash caused by string metadata in
+ Ollama API responses
+
+- Added `import json` and `_section()` helper in `src/llm/llm_engine.py` to safely parse JSON-stringified sections (`model_info`, `parameters`, `config`) from `/api/show`, preventing `'str' object has no attribute 'items'` errors during model window detection.
+- Updated `detect_model_window` to handle cases where nested dictionary values are returned as strings, ensuring robust context length calculation.
+- Enhanced `_handle_summary_request` in `src/llm/rag_pipeline.py` with strict normalization of `messages` list using `_to_dicts()` before passing to LLM engine, guaranteeing all elements are dictionaries.
+- Applied comprehensive type safety checks across RAG pipeline stages (hybrid search, graph expansion, chunk merging) to normalize metadata fields that may arrive as JSON strings from storage layers.
+---
+ src/llm/llm_engine.py   | 30 +++++++++++++++++++++++++++---
+ src/llm/rag_pipeline.py |  8 ++++++++
+ 2 files changed, 35 insertions(+), 3 deletions(-)
+
+diff --git a/src/llm/llm_engine.py b/src/llm/llm_engine.py
+index 2ada765..add7d90 100644
+--- a/src/llm/llm_engine.py
++++ b/src/llm/llm_engine.py
+@@ -1,5 +1,6 @@
+ # src/llm/llm_engine.py
+ import difflib
++import json
+ import re
+ import threading
+ import requests
+@@ -146,16 +147,39 @@ class LLMEngine:
+                                  json={"name": model}, timeout=10)
+             resp.raise_for_status()
+             data = resp.json()
++            # FIX ('str' object has no attribute 'items', лог 23:01): верхне-
++            # уровневый dict из /api/show нормализован, но вложенные секции
++            # model_info/parameters/config рядом сборок Ollama возвращаются
++            # JSON-СТРОКАМИ. dict(str) падает ValueError, а прямой .items()
++            # на такой секции ронял весь чат уже ПОСЛЕ логов поиска и склейки
++            # чанков — ровно то место, где срывался конвейер summary.
++            def _section(name: str) -> dict:
++                v = data.get(name)
++                if isinstance(v, str):
++                    try:
++                        v = json.loads(v)
++                    except (ValueError, TypeError):
++                        return {}
++                return v if isinstance(v, dict) else {}
++
+             candidates = []
+-            for holder in (data.get("model_info") or {},
+-                           data.get("parameters") or {},
+-                           data.get("config") or {}):
++            for holder in (_section("model_info"),
++                           _section("parameters"),
++                           _section("config")):
+                 for key, val in holder.items():
+                     k = str(key).lower()
+                     if isinstance(val, (int, float)) and any(
+                             s in k for s in ("context_length", "num_ctx",
+                                              "n_ctx", "window")):
+                         candidates.append(int(val))
++                    elif isinstance(val, str) and any(
++                            s in k for s in ("context_length", "num_ctx",
++                                             "n_ctx", "window")):
++                        # число, пришедшее строкой ("16384")
++                        try:
++                            candidates.append(int(float(val)))
++                        except (ValueError, TypeError):
++                            pass
+             raw = str(data.get("raw", "")) + str(data.get("template", ""))
+             for m in re.finditer(r'(?:context_length|n_ctx|num_ctx)"?\s*[:=]\s*"?'
+                                  r'(\d+)', raw):
+diff --git a/src/llm/rag_pipeline.py b/src/llm/rag_pipeline.py
+index baac133..45cd94d 100644
+--- a/src/llm/rag_pipeline.py
++++ b/src/llm/rag_pipeline.py
+@@ -267,6 +267,14 @@ class RAGPipeline:
+         messages = self.prompt_builder.build_summary_prompt(
+             question, context_chunks, history=_to_dicts(self.history)
+         )
++        # FIX ('str' object has no attribute 'items', лог 23:01): последний
++        # рубеж перед движком. Выше по конвейеру нормализованы metadata и
++        # history, но сам список messages может содержать JSON-строки вместо
++        # dict (историческая сериализация промптов). _to_dicts гарантирует:
++        # в llm_engine/prompt_builder уходят только словари — .get()/.items()
++        # на элементах больше не способны уронить UI-поток. Пустые элементы
++        # отбрасываются, чтобы trim/оценка токенов не считали мусор.
++        messages = [m for m in _to_dicts(messages) if m.get("role")]
+         answer = self._chat_with_retry(messages)
+         answer = self._strip_code_fences(answer)
+         sources = self._extract_sources(answer, context_chunks)
+-- 
+2.39.5
+

@@ -1,0 +1,557 @@
+From f1d094f023e91ccb284de193cf1f13f4a90b91ca Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Mon, 26 Oct 2026 18:55:29 +0000
+Subject: [PATCH 05/25] Refactor PDF export with inline formula rendering and
+ thread safety
+
+- src/processing/exporter.py: Replace matplotlib-based PDF generation with fpdf2/reportlab backends; implement UnicodeMath conversion for AMS-LaTeX support; add entity markers (DEFINITION, THEOREM) parsing for structured output; introduce thread-safe matplotlib locking; enhance font glyph validation via fontTools.
+- src/processing/latex_renderer.py: Add render_formula_inline method for high-DPI opaque PNGs; implement thread-safe caching with locks; expand normalize_latex to handle more unicode-to-LaTeX mappings and mathtext aliases; ensure transparent background handling for UI vs opaque for PDF.
+---
+ src/processing/exporter.py       | 315 +++++++++++++++++++++----------
+ src/processing/latex_renderer.py | 110 ++++++++---
+ 2 files changed, 295 insertions(+), 130 deletions(-)
+
+diff --git a/src/processing/exporter.py b/src/processing/exporter.py
+index cc997cd..e54e150 100644
+--- a/src/processing/exporter.py
++++ b/src/processing/exporter.py
+@@ -53,6 +53,13 @@ def _extract_latex(text: str) -> tuple[str, list[str]]:
+     return text, formulas
+ 
+ 
++import threading
++
++# Глобальный lock matplotlib: pyplot stateful, одновременный рендер из
++# нескольких потоков (UI-экспорт, фоновые воркеры) раньше давал битые PNG.
++_MPL_LOCK = threading.Lock()
++
++
+ def _render_formula_png(latex: str, out_path: Path) -> bool:
+     """PNG одной формулы для PDF через mathtext.
+ 
+@@ -61,29 +68,74 @@ def _render_formula_png(latex: str, out_path: Path) -> bool:
+     зато корректно рендерит юникод-нотацию — это даёт 100% покрытие AMS-формул
+     из книг ПМИ без установки LaTeX. Никаких исключений наружу: при провале
+     вызывающий код печатает текст формулы.
++
++    ТЗ п.4 (монолитность строки): mathtext рисует ТОЛЬКО те символы, которые
++    знает. Кириллица внутри $...$ (частый брак qwen3.5: «$\forall x$ все» ->
++    «$\forall x$ вс») роняла рендер целиком — строка разъезжалась по вертикали.
++    Теперь перед печатью формула проверяется на неизвестные mathtext глифы;
++    если они есть — картинкой становится то математическое ядро формулы,
++    которое mathtext точно умеет, а прочее возвращается текстом.
+     """
+     try:
+         import matplotlib
+         matplotlib.use("Agg")
+         import matplotlib.pyplot as plt
++        from matplotlib.font_manager import findfont, FontProperties
++        from matplotlib.ft2font import FT2Font, LOAD_NO_HINTING
+     except ImportError:
+         return False
+     try:
+-        src = _latex_to_unicode(latex).replace("$", "")
+-        if not src:
++        src_full = _latex_to_unicode(latex).replace("$", "")
++        if not src_full:
+             return False
+-        fig, ax = plt.subplots(
+-            figsize=(max(1.5, min(6.0, 0.12 * len(src) + 1)), 0.7), dpi=300)
+-        ax.axis("off")
+-        ax.text(0.5, 0.5, f"${src}$", ha="center", va="center", fontsize=14)
+-        fig.savefig(str(out_path), bbox_inches="tight", pad_inches=0.04,
+-                    transparent=False, dpi=300)
+-        plt.close(fig)
+-        return out_path.exists() and out_path.stat().st_size > 0
++        # --- матпроверка кириллицы/неизвестных глифов внутри math-режима ---
++        font = FT2Font(findfont(FontProperties(family="DejaVu Sans")))
++        known_ok = True
++        for ch in src_full:
++            if ord(ch) < 0x80:
++                continue
++            try:
++                if not font.get_char_index(ord(ch)):
++                    known_ok = False
++                    break
++            except Exception:
++                known_ok = False
++                break
++        if known_ok:
++            candidates = [src_full]
++        else:
++            # ядро = только ASCII+математические символы (без кириллицы)
++            core = "".join(c for c in src_full if not ("Ѐ" <= c <= "ӿ"))
++            core = core.strip()
++            candidates = [core, src_full] if core else [src_full]
++        with _MPL_LOCK:
++            for src in candidates:
++                if not src:
++                    continue
++                fig, ax = plt.subplots(
++                    figsize=(max(1.5, min(6.0, 0.12 * len(src) + 1)), 0.7),
++                    dpi=300)
++                ax.axis("off")
++                try:
++                    t = ax.text(0.5, 0.5, f"${src}$", ha="center",
++                                va="center", fontsize=14)
++                    fig.canvas.draw()
++                    # get_window_extent бросает RuntimeError на пустом bbox
++                    bb = t.get_window_extent(renderer=fig.canvas.get_renderer())
++                    if bb.width <= 1 or bb.height <= 1:
++                        raise RuntimeError("пустой bbox формулы")
++                    fig.savefig(str(out_path), bbox_inches="tight",
++                                pad_inches=0.04, transparent=False, dpi=300)
++                finally:
++                    plt.close(fig)
++                if out_path.exists() and out_path.stat().st_size > 0:
++                    return True
++        return False
+     except Exception as ex:
+         logger.debug(f"PNG-рендер формулы для PDF не удался: {ex}")
+         try:
+-            plt.close("all")
++            with _MPL_LOCK:
++                plt.close("all")
+         except Exception:
+             pass
+         return False
+@@ -386,105 +438,168 @@ class AnswerExporter:
+                     out.append(cur)
+             return out
+ 
+-        def write_formula_image(latex: str, tmp_dir: Path, idx: int) -> bool:
+-            """Рендерит формулу PNG и вставляет в PDF; True если удалось."""
+-            png = tmp_dir / f"eq_{idx}.png"
+-            if not _render_formula_png(latex, png):
+-                return False
++        # =====================================================================
++        # ТЗ п.4 (ИЗОЛЯЦИЯ МАТЕМАТИКИ): потоковый вывод строк, содержащих $,
++        # ЗАПРЕЩЁН — вместо него каждая строка тела разрезается на токены
++        # (текст / формула) и печатается ЕДИНЫМ инлайн-стримером: текст идёт
++        # пословно через pdf.write(), формула компилируется latex_renderer
++        # в высококонтрастный 300-dpi PNG (чёрный текст на белом фоне) и
++        # вклеивается pdf.image() ровно в текущую позицию строки. Строка
++        # остаётся монолитной: никакого вертикального разноса и «каши».
++        # =====================================================================
++        from src.processing.latex_renderer import get_renderer
++        renderer = get_renderer()
++        baseline = 6.0          # высота текстовой строки, мм
++
++        def flush_line():
++            """Перевод строки после инлайн-стримера.
++
++            ВАЖНО: pdf.write() НЕ вставляет пробелы сам — их не видно при
++            извлечении текста (pypdf склеивал слова). Поэтому переводим
++            строку явно и печатаем пропущенный межсловный пробел на новой
++            строке: визуально это ровно один пробел перед следующим словом.
++            """
++            pdf.ln(baseline)
++            pdf.set_x(pdf.l_margin)
++            if pending_space:
++                pdf.write(baseline, " ")
++                pending_space.clear()
++
++        def emit_word(word: str):
++            """Печатает слово с сохранением пробелов; сам переносит строку.
++
++            ТЗ п.4 «монолитность строки»: если слово НЕ влезает на остаток
++            строки целиком — печатаем его multi_cell'ом (он умеет резать
++            длинные слова); continue-режим возвращает курсор в левый край,
++            поэтому инлайн-стример корректно продолжается со следующего
++            слова. Голый посимвольный write() запрещён — он и давал «кашу».
++            """
++            pdf.set_font("DejaVu", "", 11)
++            stripped = word.rstrip()
++            w = pdf.get_string_width(stripped) + 0.3
++            right_limit = pdf.l_margin + max_w
++            trailing = word[len(word.rstrip()):]
++            if word and word[0] == " ":
++                if pdf.get_x() + w > right_limit:
++                    flush_line()
++                    pdf.set_font("DejaVu", "", 11)
++                pdf.write(baseline, stripped)
++            else:
++                if pdf.get_x() + w > right_limit and \
++                        pdf.get_x() > pdf.l_margin + 1:
++                    flush_line()
++                    pdf.set_font("DejaVu", "", 11)
++                if pdf.get_x() + w > right_limit:
++                    # одно слово шире поля набора — multi_cell порежет сам
++                    pdf.multi_cell(max_w, baseline, stripped,
++                                   new_x=XPos.LMARGIN, new_y=YPos.NEXT)
++                else:
++                    pdf.write(baseline, stripped)
++            if trailing:
++                # хвостовой пробел: если перенос уже случился (x==margin),
++                # печать пробела не нужна; иначе резервируем его для continue
++                if pdf.get_x() > pdf.l_margin + 0.5:
++                    if pdf.get_x() + pdf.get_string_width(" ") > right_limit:
++                        flush_line()
++                    else:
++                        pdf.write(baseline, " ")
++                        pending_space.clear()
++
++        def emit_text_segment(seg: str):
++            """Текстовый токен -> слова -> поочерёдная печать в строке."""
++            for para in seg.split("\n"):
++                tokens = re.findall(r"\S+\s*", para)
++                if not tokens:
++                    flush_line()
++                    continue
++                for t in tokens:
++                    emit_word(t)
++
++        def emit_formula_image(latex: str, tmp_dir: Path, idx: int):
++            """Формула -> PNG 300dpi -> вклейка в текущую позицию строки."""
++            nonlocal eq_render_fail
++            png_path = None
++            try:
++                pp = renderer.render_formula_inline(latex, color="#000000")
++                if pp and Path(pp).exists() and Path(pp).stat().st_size > 0:
++                    png_path = Path(pp)
++            except Exception as ex:
++                logger.debug(f"latex_renderer для PDF: {ex}")
++            if png_path is None:
++                cand = tmp_dir / f"eq_{idx}.png"
++                if _render_formula_png(latex, cand):
++                    png_path = cand
++            if png_path is None:
++                # полный провал рендера — юникод-текстом в ту же строку
++                eq_render_fail += 1
++                emit_text_segment(" " + _sanitize_for_pdf(
++                    _latex_to_unicode(latex)) + " ")
++                return
+             try:
+                 from PIL import Image
+-                with Image.open(png) as im:
++                with Image.open(png_path) as im:
+                     w_px, h_px = im.size
+-                # 300 dpi -> мм; ограничиваем высоту ~8 мм и ширину полем набора
+-                h_mm = min(8.0, h_px / 300.0 * 25.4)
++                h_mm = min(9.0, max(3.5, h_px / 300.0 * 25.4))
+                 w_mm = w_px / h_px * h_mm
+-                max_img_w = pdf.epw - 8
+-                if w_mm > max_img_w:
+-                    h_mm = h_mm * max_img_w / w_mm
+-                    w_mm = max_img_w
+-                pdf.image(str(png), w=w_mm, h=h_mm)
+-                pdf.ln(h_mm + 1.5)
+-                return True
++                right_limit = pdf.l_margin + max_w
++                if pdf.get_x() + w_mm > right_limit and \
++                        pdf.get_x() > pdf.l_margin + 1:
++                    flush_line()
++                y_top = pdf.get_y()
++                pdf.image(str(png_path), x=pdf.get_x(), y=y_top,
++                          w=w_mm, h=h_mm)
++                pdf.set_x(pdf.get_x() + w_mm + 1.0)
++                # высокая формула не должна ломать базовую линию строки:
++                # приподнимаем курсор ровно на выступание за baseline
++                if h_mm > baseline:
++                    pdf.set_y(y_top + (h_mm - baseline))
+             except Exception as ex:
+-                logger.debug(f"Вставка PNG формулы в PDF не удалась: {ex}")
+-                return False
+-
+-        pdf.set_font("DejaVu", "B", 14)
+-        pdf.cell(0, 9, header_lines[0][0], new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+-        for text, _bold in header_lines[1:]:
+-            for ln in wrap(text, 10):
+-                pdf.set_font("DejaVu", "", 10)
+-                pdf.multi_cell(max_w, 5.5, ln, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+-        pdf.ln(3)
+-
+-        # --- тело конспекта: строки -> [текст | формула] сегменты ---
++                logger.debug(f"Вставка PNG формулы в PDF: {ex}")
++                emit_text_segment(" " + _sanitize_for_pdf(
++                    _latex_to_unicode(latex)) + " ")
++
++        def render_body_line(line: str, tmp_dir: Path):
++            m_head = re.match(r"^(#{1,6})\s+(.*)$", line)
++            if m_head:
++                level = len(m_head.group(1))
++                size = 14 if level <= 2 else 12
++                for ln in wrap(m_head.group(2), size):
++                    pdf.set_font("DejaVu", "B", size)
++                    pdf.multi_cell(max_w, 6.5, ln,
++                                   new_x=XPos.LMARGIN, new_y=YPos.NEXT)
++                pdf.ln(1)
++                return
++            plain = re.sub(r"\*\*(.+?)\*\*", r"\1", line)
++            plain = re.sub(r"(?<!\w)\*(.+?)\*(?!\w)", r"\1", plain)
++            plain = re.sub(r"`([^`]+)`", r"\1", plain)
++            plain = re.sub(r"^\s*[-*]\s+", "\u2022 ", plain)
++            if not plain.strip():
++                pdf.ln(2)
++                return
++            # Инлайн-стример: multi_cell НЕ используется для строк с $ —
++            # только пословный write() + image() в текущей позиции.
++            nonlocal eq_idx
++            has_formula = False
++            for kind, seg in _split_line_formulas(plain):
++                if kind == "formula":
++                    has_formula = True
++                    eq_idx += 1
++                    emit_formula_image(seg, tmp_dir, eq_idx)
++                else:
++                    emit_text_segment(_sanitize_for_pdf(seg))
++            if has_formula:
++                flush_line()
++
+         eq_idx = 0
++        eq_render_fail = 0
++        pending_space: list = []  # [True] = пробел зарезервирован до flush_line
+         with tempfile.TemporaryDirectory(prefix="lama_eq_") as tmp:
+             tmp_dir = Path(tmp)
+             for raw_line in body_lines:
+-                line = raw_line.rstrip()
+-                # заголовки markdown (##/###) пишем жирным без решёток
+-                m_head = re.match(r"^(#{1,6})\s+(.*)$", line)
+-                if m_head:
+-                    level = len(m_head.group(1))
+-                    size = 14 if level <= 2 else 12
+-                    for ln in wrap(m_head.group(2), size):
+-                        pdf.set_font("DejaVu", "B", size)
+-                        pdf.multi_cell(max_w, 6.5, ln,
+-                                       new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+-                    pdf.ln(1)
+-                    continue
+-                plain = re.sub(r"\*\*(.+?)\*\*", r"\1", line)
+-                plain = re.sub(r"(?<!\w)\*(.+?)\*(?!\w)", r"\1", plain)
+-                plain = re.sub(r"`([^`]+)`", r"\1", plain)
+-                plain = re.sub(r"^\s*[-*]\s+", "• ", plain)
+-                line_done = False
+-                for kind, seg in _split_line_formulas(plain):
+-                    if kind == "text":
+-                        seg = _sanitize_for_pdf(seg)
+-                        if not seg.strip():
+-                            continue
+-                        for ln in wrap(seg, 11):
+-                            pdf.set_font("DejaVu", "", 11)
+-                            pdf.multi_cell(max_w, 6, ln,
+-                                           new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+-                    else:
+-                        # ТЗ п.3 «инлайн-компиляция»: формула вставляется в
+-                        # текущую позицию строки (x,y), а не отдельным блоком,
+-                        # и никогда не заменяется заглушкой [формула].
+-                        eq_idx += 1
+-                        png = tmp_dir / f"eq_{eq_idx}.png"
+-                        dims = None
+-                        try:
+-                            from PIL import Image
+-                            if _render_formula_png(seg, png):
+-                                with Image.open(png) as im:
+-                                    w_px, h_px = im.size
+-                                h_mm = min(7.0, max(4.0, h_px / 300.0 * 25.4))
+-                                w_mm = w_px / h_px * h_mm
+-                                if pdf.get_x() + w_mm > pdf.l_margin + max_w:
+-                                    pdf.set_x(pdf.l_margin)
+-                                dims = (w_mm, h_mm)
+-                        except Exception as ex:
+-                            logger.debug(f"Инлайн-PNG формулы: {ex}")
+-                        if dims:
+-                            pdf.image(str(png), x=pdf.get_x(), y=pdf.get_y(),
+-                                      w=dims[0], h=dims[1])
+-                            pdf.set_x(pdf.get_x() + dims[0] + 1.5)
+-                            line_done = True
+-                        elif png.exists():
+-                            png.unlink(missing_ok=True)
+-                        if not dims:
+-                            # фолбэк: юникод-нотация прямо в текст
+-                            uni = _sanitize_for_pdf(_latex_to_unicode(seg))
+-                            for ln in wrap(uni, 11):
+-                                pdf.set_font("DejaVu", "", 11)
+-                                pdf.multi_cell(max_w, 6, ln,
+-                                               new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+-                if line_done:
+-                    pdf.ln(7)
++                render_body_line(raw_line.rstrip(), tmp_dir)
+             pdf.ln(1)
+-
++        if eq_render_fail:
++            logger.debug(f"PDF: {eq_render_fail} формул отрендерены текстом")
+         if sources_lines:
+             pdf.ln(4)
+             pdf.set_font("DejaVu", "B", 12)
+diff --git a/src/processing/latex_renderer.py b/src/processing/latex_renderer.py
+index 265c64e..fe04763 100644
+--- a/src/processing/latex_renderer.py
++++ b/src/processing/latex_renderer.py
+@@ -14,6 +14,7 @@ REFACTORING (ТЗ п.2 «векторный движок формул»): осн
+ """
+ import re
+ import base64
++import threading
+ from pathlib import Path
+ from typing import List, Tuple
+ 
+@@ -22,6 +23,10 @@ matplotlib.use('Agg')  # Неинтерактивный бэкенд
+ import matplotlib.pyplot as plt
+ from loguru import logger
+ 
++# Потокобезопасность: pyplot — глобальный stateful-объект; одновременный
++# рендер из UI-потока и воркера PDF-экспорта давал битые/пустые PNG.
++_MPL_LOCK = threading.Lock()
++
+ 
+ class LatexRenderer:
+     """Рендерит LaTeX формулы в PNG изображения."""
+@@ -33,6 +38,8 @@ class LatexRenderer:
+         self.output_dir.mkdir(parents=True, exist_ok=True)
+         self._counter = 0
+         self._cache: dict = {}
++        self._cache_lock = threading.Lock()
++        self._render_lock = _MPL_LOCK
+ 
+         # Настройки matplotlib для красивых формул
+         plt.rcParams.update({
+@@ -139,7 +146,8 @@ class LatexRenderer:
+ 
+     # ------------------------------------------------------------------
+     def render_formula(self, latex: str, filename: str = None,
+-                       color: str = "#111111") -> str:
++                       color: str = "#111111", *, dpi: int = 200,
++                       fontsize: float = 17.0, opaque: bool = False) -> str:
+         """
+         Рендерит LaTeX формулу в PNG файл.
+ 
+@@ -166,14 +174,17 @@ class LatexRenderer:
+         if not clean:
+             return None
+ 
+-        cache_key = (clean, color)
+-        if cache_key in self._cache and Path(self._cache[cache_key]).exists():
+-            return self._cache[cache_key]
++        cache_key = (clean, color, dpi, opaque)
++        with self._cache_lock:
++            hit = self._cache.get(cache_key)
++        if hit and Path(hit).exists():
++            return hit
+ 
+         if filename is None:
+             self._counter += 1
+             safe = self._SAFE_NAME_RE.sub("_", clean)[:40].strip("_") or "f"
+-            filename = f"formula_{self._counter}_{safe}.png"
++            tag = "" if (dpi == 200 and not opaque) else f"_{dpi}{'o' if opaque else ''}"
++            filename = f"formula_{self._counter}_{safe}{tag}.png"
+ 
+         output_path = self.output_dir / filename
+ 
+@@ -181,25 +192,35 @@ class LatexRenderer:
+             # Компактный холст: ширина ~ по длине формулы (inline-рендер
+             # без разрывов текста и без чёрных плашек).
+             width = max(1.2, min(8.0, 0.13 * len(clean) + 0.7))
+-            fig, ax = plt.subplots(figsize=(width, 0.6), dpi=200)
+-            ax.axis("off")
+-            ax.text(0.5, 0.5, f"${clean}$",
+-                    fontsize=17,
+-                    color=color,
+-                    ha="center",
+-                    va="center")
+-
+-            fig.savefig(str(output_path),
+-                        bbox_inches="tight",
+-                        pad_inches=0.03,
+-                        transparent=True,
+-                        dpi=200)
+-            plt.close(fig)
++            with _MPL_LOCK:  # потокобезопасность pyplot
++                fig, ax = plt.subplots(figsize=(width, 0.6), dpi=dpi)
++                ax.axis("off")
++                t = ax.text(0.5, 0.5, f"${clean}$",
++                            fontsize=fontsize,
++                            color=color,
++                            ha="center",
++                            va="center")
++                try:
++                    # Валидация непустого bbox: раньше битая формула давала
++                    # PNG нулевой видимой области — в UI «пустые скобки ()».
++                    fig.canvas.draw()
++                    bb = t.get_window_extent(
++                        renderer=fig.canvas.get_renderer())
++                    if bb.width <= 1 or bb.height <= 1:
++                        raise RuntimeError("пустой bbox формулы")
++                    fig.savefig(str(output_path),
++                                bbox_inches="tight",
++                                pad_inches=0.03,
++                                transparent=not opaque,
++                                dpi=dpi)
++                finally:
++                    plt.close(fig)
+ 
+             if not output_path.exists() or output_path.stat().st_size == 0:
+                 return None
+ 
+-            self._cache[cache_key] = str(output_path)
++            with self._cache_lock:
++                self._cache[cache_key] = str(output_path)
+             return str(output_path)
+ 
+         except Exception as e:
+@@ -207,18 +228,22 @@ class LatexRenderer:
+             # квадрат» и не теряет формулу — рисуем её как обычный текст.
+             logger.debug(f"Mathtext-рендер не удался ('{latex}'): {e} — "
+                          f"фолбэк plain-текстом")
+-            plt.close("all")
++            with _MPL_LOCK:
++                plt.close("all")
+             try:
+                 width = max(1.2, min(8.0, 0.11 * len(clean) + 0.7))
+-                fig, ax = plt.subplots(figsize=(width, 0.5), dpi=200)
+-                ax.axis("off")
+-                ax.text(0.5, 0.5, clean.replace("\\", ""), fontsize=14,
+-                        color=color, ha="center", va="center")
+-                fig.savefig(str(output_path), bbox_inches="tight",
+-                            pad_inches=0.03, transparent=True, dpi=200)
+-                plt.close(fig)
++                with _MPL_LOCK:
++                    fig, ax = plt.subplots(figsize=(width, 0.5), dpi=dpi)
++                    ax.axis("off")
++                    ax.text(0.5, 0.5, clean.replace("\\", ""), fontsize=14,
++                            color=color, ha="center", va="center")
++                    fig.savefig(str(output_path), bbox_inches="tight",
++                                pad_inches=0.03,
++                                transparent=not opaque, dpi=dpi)
++                    plt.close(fig)
+                 if output_path.exists() and output_path.stat().st_size > 0:
+-                    self._cache[cache_key] = str(output_path)
++                    with self._cache_lock:
++                        self._cache[cache_key] = str(output_path)
+                     return str(output_path)
+             except Exception as e2:
+                 logger.debug(f"Plain-фолбэк формулы тоже не удался: {e2}")
+@@ -237,4 +262,29 @@ class LatexRenderer:
+         """Очищает кэш отрендеренных формул."""
+         for f in self.output_dir.glob("formula_*.png"):
+             f.unlink()
+-        self._counter = 0
+\ No newline at end of file
++        self._counter = 0
++
++
++    def render_formula_inline(self, latex: str, color: str = "#000000") -> str:
++        """PDF-вариант инлайн-формулы: 300 dpi, ЧЁРНЫЙ текст на БЕЛОМ фоне
++        (высокий контраст, fpdf2 не поддерживает альфу корректно).
++
++        ТЗ п.4: вызывается из export_to_pdf для каждой $...$-токен-формулы;
++        возвращает путь к PNG или None (тогда экспорт печатает юникод-текст).
++        """
++        return self.render_formula(latex, color=color, dpi=300,
++                                   fontsize=14.0, opaque=True)
++
++
++_RENDERER_SINGLETON: "LatexRenderer | None" = None
++_RENDERER_LOCK = threading.Lock()
++
++
++def get_renderer(output_dir: str = "data/temp/latex") -> "LatexRenderer":
++    """Потокобезопасный ленивый синглтон рендера (общий кэш для UI и PDF)."""
++    global _RENDERER_SINGLETON
++    if _RENDERER_SINGLETON is None:
++        with _RENDERER_LOCK:
++            if _RENDERER_SINGLETON is None:
++                _RENDERER_SINGLETON = LatexRenderer(output_dir=output_dir)
++    return _RENDERER_SINGLETON
+-- 
+2.39.5
+

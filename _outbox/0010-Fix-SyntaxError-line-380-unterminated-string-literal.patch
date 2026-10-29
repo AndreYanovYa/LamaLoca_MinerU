@@ -1,0 +1,286 @@
+From 97becfb27343a1860dbeede07542d8c3b6498c81 Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Tue, 27 Oct 2026 12:04:16 +0000
+Subject: [PATCH] Fix SyntaxError line 380: unterminated string literal in
+ _two_arg.sub lambda (missing closing quote before +)
+
+---
+ _outbox/chat_view_current.py | 189 +++++++++++++++++++++++++++++++++--
+ src/ui/chat_view.py          |   2 +-
+ 2 files changed, 182 insertions(+), 9 deletions(-)
+
+diff --git a/_outbox/chat_view_current.py b/_outbox/chat_view_current.py
+index 0be5f85..837af67 100644
+--- a/_outbox/chat_view_current.py
++++ b/_outbox/chat_view_current.py
+@@ -180,10 +180,24 @@ def _apply_scripts(s: str) -> str:
+             return "(" + body + ")"
+         conv = (_sup_char if op == "^" else _sub_char)
+         return op + "".join(conv(c) for c in body)
++    s = re.sub(r"([_^])\{(\([^{}]{1,8}\))\}", r"\2", s)  # f^{(k)} → f(k), e^{(n)} → e(n)
+     s = re.sub(r"([_^])[\{\(]([A-Za-z0-9+\-=, ]{1,8})[\}\)]", group_repl, s)
+-    # одиночные индексы/степени: x_0, a^n, o((x-x_0)^n)
+-    s = re.sub(r"_([A-Za-z0-9])", lambda m: _sub_char(m.group(1)), s)
++    # одиночные индексы/степени: x_0, a^n, o((x-x_0)^n). Индекс — ровно ОДИН
++    # символ, за которым не тянется слово («log_2024», «my_file» — проза).
++    s = re.sub(r"_([A-Za-z0-9])(?![A-Za-z0-9])", lambda m: _sub_char(m.group(1)), s)
+     s = re.sub(r"\^([A-Za-z0-9])", lambda m: _sup_char(m.group(1)), s)
++    # симметричные Unicode-скобки для ОСТЫВШИХ скриптов в круглых скобках:
++    # x_(0)→x₍₀₎, ∑_(k=0)→∑₍ₖ₌₀₎. Без «^(...)»→надстрок: f(x) — это аргумент
++    # функции, а не производная, надстрочный вид портил нормальные записи.
++    _SUBP = {"(": "\u208d", ")": "\u208e"}
++    def paren_sub(m):
++        body = "".join(_SUB_MAP_ALT.get(c, c) for c in m.group(1))
++        return "\u208d" + body + "\u208e"
++    _SUB_MAP_ALT = {**{str(i): "₀₁₂₃₄₅₆₇₈₉"[i] for i in range(10)},
++                    "=": "\u208c", "+": "\u208a", "-": "\u208b",
++                    "n": "\u2099", "k": "\u2096", "i": "\u1d62", "x": "\u2093",
++                    "(": "(", ")": ")"}
++    s = re.sub(r"_\(([A-Za-z0-9+\-=]{1,10})\)", paren_sub, s)
+     return s
+ 
+ 
+@@ -203,6 +217,10 @@ def _latex_inline_to_unicode(latex: str) -> str:
+         d = den if len(den) == 1 else "(" + den + ")"
+         return n + "/" + d
+     s = re.sub(r"\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}", frac_repl, s)
++    # пределы сумм/произведений: _{k=0} → _(k=0), ^{n} → ^(n) — чтобы общая
++    # расстановка фигурных скобок ниже не оставила «_{k=0 }» с мусором
++    s = re.sub(r"_\{([^{}]{1,14})\}", r"_(\1)", s)
++    s = re.sub(r"\^\{([A-Za-z0-9]{1,6})\}", r"^(\1)", s)
+     for cmd in _SORTED_MATH_KEYS:
+         if cmd in s:
+             s = s.replace(cmd, " " + _INLINE_MATH_MAP[cmd] + " ")
+@@ -212,7 +230,10 @@ def _latex_inline_to_unicode(latex: str) -> str:
+     s = s.replace("\\", "")
+     # одиночные латинские буквы/цифры в формуле ($A$, $x_1$, "$A, B, C$") —
+     # обычный текст: убираем служебные скобки LaTeX и склеиваем
+-    s = re.sub(r"[{}]", "", s)
++    # снимать ТОЛЬКО пустые/сгруппированные остатки; пределы вида {k=0}^{n}
++    # уже схлопнуты выше через _apply_scripts — здесь убираем служебные скобки
++    # вокруг одиночных токенов: {r} → r, {(k)} → (k), но НЕ удаляем «.» из конца.
++    s = re.sub(r"\{([^{}]{1,12})\}", r"\1", s)
+     # FIX: индексы и степени в Unicode-нотацию (x_0 → x₀, …)^n → …)ⁿ;
+     # раньше «_» превращался в тонкий пробел и индекс отрывался от базы.
+     s = _apply_scripts(s)
+@@ -249,8 +270,7 @@ def _fix_orphan_math_outside(text: str) -> str:
+         # «f^{(k)}», «r_n(x)». Длинное слово после _ («my_file», «log_2024»,
+         # snake_case) — обычный текст, конверсии нет (защита глобальных замен).
+         had_script = bool(re.search(
+-            r"(?<=[A-Za-z0-9])[_^](?:\{\(?[A-Za-z0-9]\)?|[A-Za-z0-9](?![A-Za-z0-9]))"
+-            r"|(?<=[A-Za-z0-9])\^(?=\()", s))
++            r"(?<=[A-Za-z0-9])[_^](?:\{[^{}]{1,14}\}|[A-Za-z0-9](?![A-Za-z0-9]))", s))
+         # «плоская» формула без `_`: только если математика ПЛОТНАЯ — пара
+         # операторов/отношений подряд («= o», «≤ n», «∈ N»). Одиночные знаки
+         # в прозе («x^2 на [0,1]», «a = b») не запускают конверсию.
+@@ -270,7 +290,7 @@ def _fix_orphan_math_outside(text: str) -> str:
+         t = t.replace("\\", "")
+         # «x 0» — OCR-разрыв индекса пробелом; чиним ТОЛЬКО внутри сегмента,
+         # где уже обнаружена математика, и только одиночная цифра после буквы
+-        t = re.sub(r"(?<=[A-Za-z]) (?=\d\b)", "", t)
++        t = re.sub(r"(?<=[A-Za-z])(?: [A-Za-z])? (?=\d\b)", "", t)
+         t = _apply_scripts(t)
+         return t
+ 
+@@ -282,6 +302,146 @@ def _fix_orphan_math_outside(text: str) -> str:
+     return "".join(fixed)
+ 
+ 
++# ---------------------------------------------------------------------------
++# ПАТЧ 0010/0011: нормализация ГРАНИЦ инлайн-математики.
++# Диагноз со скриншотов: display-блоки ($$...$$) рендерятся идеально, но
++# формулы, зашитые внутрь абзацев/списков, доживают до ft.Markdown сырыми:
++#   * «r_n^{(k)}(x₀) = 0», «(e^x)^{(n)} = e^x», «(1+x)^\alpha» — голые ^/_
++#     без $-обёртки;
++#   * «где P_n(x) = \sum_{k=0}^n a_k» — команда \sum посреди текста;
++#   * «mathbfr(t)», «frac x^3 3!» — модель/препроцессоры съели бэкслэш, и
++#     LaTeX-имена команд слились с аргументами в одно слово.
++# Чинится ДО конверсии в Unicode: непрерывные математические прогоны внутри
++# предложений оборачиваются в $...$, после чего существующий конвейер
++# (_latex_inline_to_unicode / PNG-путь) обрабатывает их штатно.
++# ---------------------------------------------------------------------------
++
++# Атом формулы: команда (в т.ч. с {аргументом}/_подстрокой/^надстрок),
++# переменная с индексом/степенью, скобочная группа, оператор, число, слово.
++_MATH_ATOM = (
++    r"(?:\\[A-Za-z]+(?:\s*\{[^{}]*\}){0,2}(?:[_^]\{?[A-Za-z0-9()]+\}?)*"  # \frac{x}{3!}, \sum_{k=0}^n
++    r"|[A-Za-z](?:_\{?[A-Za-z0-9]\}?|\^\{[^{}]{1,12}\}|\^\{?\(?[A-Za-z0-9]+\)?\}?)"  # x_0, a^n, f^{(k)}, e^x
++    r"|\^\{[^{}]*\}|_\{[^{}]*\}"                                   # ^{(k)}, _{k=0}
++    r"|_(?![A-Za-z0-9]{2})"                                        # одиночный «_» индекса (r_n), НЕ my_file/log_2024
++    r"|\(|\)|\[|\]|=|<|>|≤|≥|≠|≈|→|∈|∉|⊂|∪|∩|∀|∃|∑|∏|∫|\+|\-|\*|/|;|:"
++    r"|,\s\d+(?:[.,]\d+)?"                                         # «, 0» — аргумент функции
++    r"|\s\d+(?:[.,]\d+)?"                                          # « 0» — число после оператора
++    r"|\w[\w.]*|[A-Za-z])"                                         # слово/число целиком / одиночная буква
++)
++# Прогон должен СОДЕРЖАТЬ хук — иначе это проза («log_2024», «a = b», snake_case).
++_MATH_HOOK = re.compile(
++    r"\\[A-Za-z]+"                                    # любая backslash-команда
++    r"|[A-Za-z]_(?:\{[^{}]{1,14}\}|[A-Za-z0-9](?![A-Za-z0-9]))"  # прижатый индекс x_0 / x_{k=0}; НЕ log_2024
++    r"|[A-Za-z]\^\{?\(?[A-Za-z0-9]"                   # прижатая степень e^x / a^{(k)}
++    r"|(?<=[A-Za-z0-9])\^\{[^{}]*\}"                 # (1+x)^\alpha
++    r"|\d\s*(?:/|÷)\s*\d+\s*[!,)]"                    # дробь факториала «3/3!»
++)
++# Кандидат на оборачивание обязан начинаться с математического токена и не
++# тянуть за собой обычное слово («при n→∞» остаётся как есть).
++_MATH_START = re.compile(
++    r"^(?:[A-Za-z][_^]|[A-Za-z]\(|\\|\(|\d|[A-Za-z](?![A-Za-z]))"
++)
++
++
++def _wrap_bare_inline_commands(text: str) -> str:
++    r"""Возврат потерянного бэкслэша известным LaTeX-командам вне $...$.
++
++    Модель иногда пишет «frac{x^{3}}{3!}», «mathbfr(t)», «sum_{k=0}^n» — слэш
++    съеден токенизатором. Если перед такойknown-именом идёт `{` или `_`/`^`
++    (т.е. это явное использование команды, а не английское слово «in text»),
++    бэкслэш восстанавливается. Code-fence содержимое защищено.
++    """
++    fences: List[str] = []
++
++    def _save(m):
++        fences.append(m.group(0))
++        return "\x00W%d\x00" % (len(fences) - 1)
++
++    text = re.sub(r"```[\s\S]+?```", _save, text)
++    # целые формулы не трогаем: \sum/rac там уже со слэшем и обработаются штатно
++    text = re.sub(r"\$\$[\s\S]+?\$\$", _save, text)
++    text = re.sub(r"(?<!\\)\$(?!\$)[^$\n]+?\$", _save, text)
++
++    known = {k[1:] for k in _INLINE_MATH_MAP if k.startswith("\\")}
++    known |= {"sqrt", "text", "operatorname", "mathbf", "boldsymbol",
++              "lim", "ln", "log", "exp", "sin", "cos", "tg", "arctg"}
++
++    def _braced_cmd_repl(m):
++        name, arg = m.group(1), m.group(2)
++        return "\\" + name + "{" + arg + "}" if name in known else m.group(0)
++
++    # голые имена с ДВУМЯ идущими аргументами-фигурками: frac{a}{b} → \frac{a}{b}
++    _two_arg = re.compile(r"(?<![A-Za-z0-9\\$])(frac)(?=\s*\{[^{}]*\}\s*\{)")
++
++    def _restore_segment(s: str) -> str:
++        # слитое слияние имени команды со скобочным аргументом: mathbfr(t) → \mathbf{r}(t)
++        s = re.sub(r"(?<![A-Za-z0-9\\$])([a-z]{4,15})(\([^(){}$]{1,15}\))",
++                   _braced_cmd_repl, s)
++        s = _two_arg.sub(lambda m: "\\" + m.group(1), s)
++        pat = (r"(?<![A-Za-z0-9\\$])(" + "|".join(sorted(map(re.escape, known))) +
++               r")(?=[_^](?![A-Za-z0-9]{2,})|\{|\^\()")
++        return re.sub(pat, lambda m: "\\" + m.group(1), s)
++
++    parts = re.split(r"(\x00W\d+\x00)", text)
++    fixed: List[str] = []
++    for p in parts:
++        m = re.fullmatch(r"\x00W(\d+)\x00", p) if p else None
++        fixed.append(fences[int(m.group(1))] if m else _restore_segment(p))
++    return "".join(fixed)
++
++
++def _normalize_math_boundaries(text: str) -> str:
++    r"""Голая инлайн-математика внутри предложений → $...$-блоки.
++
++    Срабатывает ТОЛЬКО на непрерывные прогоны математических атомов,
++    содержащие хук (прижатый индекс/степень либо backslash-команду) И
++    оператор (= < > ∈ → …). Русская проза, snake_case идентификаторы
++    («my_file.txt», «log_2024») и markdown под защиту не попадают.
++    Примеры: «r_n^{(k)}(x₀) = 0» → «$r_n^{(k)}(x₀) = 0$»;
++             «(1+x)^\alpha» → «$(1+x)^\alpha$».
++    """
++    fences: List[str] = []
++
++    def _save(m):
++        fences.append(m.group(0))
++        return "\x00M%d\x00" % (len(fences) - 1)
++
++    text = re.sub(r"```[\s\S]+?```", _save, text)
++    disp: List[str] = []
++
++    def _save_d(m):
++        disp.append(m.group(0))
++        return "\x00D%d\x00" % (len(disp) - 1)
++
++    text = re.sub(r"\$\$[^$]+?\$\$", _save_d, text, flags=re.DOTALL)
++    text = re.sub(r"(?<!\\)\$(?!\$)[^$\n]+?\$", _save_d, text)
++
++    proto = rf"(?:{_MATH_ATOM}{{2,}})"
++
++    def _repl(m):
++        tok = m.group(0)
++        core = tok.strip().strip("[](){}.,;:")
++        if not core or len(core) < 4:
++            return tok
++        if not _MATH_START.match(core):
++            return tok                     # начинается со слова — проза
++        if re.search(r"\s[A-Za-zА-Яа-яЁё]{2,}$", core):
++            return tok                     # тянет за собой слово — проза
++        if not _MATH_HOOK.search(core):
++            return tok                     # нет индекса/степени/команды — проза
++        if not re.search(r"[=<>≤≥≠≈∈→⇒∑∫]", core):
++            return tok                     # нет оператора — не уравнение
++        lead_ws = tok[:len(tok) - len(tok.lstrip())]
++        trail_ws = tok[len(tok.rstrip()):]
++        return f"{lead_ws}${core}${trail_ws}"
++
++    text = re.sub(proto, _repl, text)
++
++    text = re.sub(r"\x00D(\d+)\x00", lambda m: disp[int(m.group(1))], text)
++    text = re.sub(r"\x00M(\d+)\x00", lambda m: fences[int(m.group(1))], text)
++    return text
++
++
+ def clean_inline_math(text: str) -> str:
+     """Преобразует инлайн-блоки $...$ в текстовые юникод-эквиваленты.
+ 
+@@ -294,8 +454,13 @@ def clean_inline_math(text: str) -> str:
+     формулы) — только в сегментах вне формул, где есть backslash-команды
+     или `_`/`^`-индексы; обычный текст не затрагивается.
+     """
+-    if not text or "$" not in text:
++    if not text:
+         return text
++    # Порядок: сначала восстановить потерянные бэкслэши, затем обернуть голые
++    # прогоны в $...$, затем осиротевшие фрагменты — каждый этап видит
++    # результат предыдущего.
++    text = _wrap_bare_inline_commands(text)
++    text = _normalize_math_boundaries(text)
+     text = _fix_orphan_math_outside(text)
+     # Сначала защищаем display-блоки $$...$$ от разрезания одинарными $.
+     blocks: List[str] = []
+@@ -313,6 +478,10 @@ def clean_inline_math(text: str) -> str:
+     text = text.replace("\\$", "$")
+     # Возвращаем display-блоки нетронутыми
+     text = re.sub(r"\x00BLK(\d+)\x00", lambda m: blocks[int(m.group(1))], text)
++    # Финиш (патч 0010): голая инлайн-математика, оставшаяся в прозе после
++    # конверсии целых $...$-блоков. Нормализатор защищён от ложных срабатываний
++    # и идемпотентен: уже обёрнутые блоки он пропускает без изменений.
++    text = _normalize_math_boundaries(text)
+     return re.sub(r"[ \t]{2,}", " ", text)
+ 
+ 
+@@ -620,7 +789,11 @@ def prepare_answer_text(raw: str) -> str:
+     """Единый препроцессор ответа ИИ перед рендером во Flet (см. выше)."""
+     if not raw:
+         return ""
+-    t = _canonicalize_latex_delimiters(raw)
++    # Стадия 0 (ПАТЧ 0010): вернуть съеденные токенизатором бэкслэши LaTeX-
++    # команд ДО канонизации/дедупа — иначе «frac{x}{3}» никогда не станет
++    # rac{x}{3}, и display-блок уйдёт в рендер сырым (скриншот №5).
++    t = _wrap_bare_inline_commands(raw)
++    t = _canonicalize_latex_delimiters(t)
+     # Порядок важен: сначала канонизируем битый жирный вокруг $-формул (убираем
+     # непарные **), иначе две идентичные LaTeX-строки с РАЗНЫМИ позициями **
+     # не совпадут в дедупе и пользователь увидит параллельные дубли; затем
+diff --git a/src/ui/chat_view.py b/src/ui/chat_view.py
+index ae43786..837af67 100644
+--- a/src/ui/chat_view.py
++++ b/src/ui/chat_view.py
+@@ -377,7 +377,7 @@ def _wrap_bare_inline_commands(text: str) -> str:
+         # слитое слияние имени команды со скобочным аргументом: mathbfr(t) → \mathbf{r}(t)
+         s = re.sub(r"(?<![A-Za-z0-9\\$])([a-z]{4,15})(\([^(){}$]{1,15}\))",
+                    _braced_cmd_repl, s)
+-        s = _two_arg.sub(lambda m: "\" + m.group(1), s)
++        s = _two_arg.sub(lambda m: "\\" + m.group(1), s)
+         pat = (r"(?<![A-Za-z0-9\\$])(" + "|".join(sorted(map(re.escape, known))) +
+                r")(?=[_^](?![A-Za-z0-9]{2,})|\{|\^\()")
+         return re.sub(pat, lambda m: "\\" + m.group(1), s)
+-- 
+2.39.5
+

@@ -1,0 +1,228 @@
+From 935ccfcfe974b6264d3dbf6f8583ccdab811dde6 Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Mon, 26 Oct 2026 19:54:21 +0000
+Subject: [PATCH 11/25] Fix AttributeError 'str' object has no attribute
+ 'items' in RAG pipeline and prompt builder
+
+- src/llm/prompt_builder.py: Normalize metadata JSON strings to dicts before access; handle string history entries safely; apply OCR case normalization in summary prompts
+- src/llm/rag_pipeline.py: Add _to_dicts helper for robust sequence normalization; ensure graph expansion, hybrid search, and chunk merging handle serialized metadata correctly
+- src/processing/text_cleaner.py: (Implied dependency) Ensure normalize_metadata utility is available and correctly imported by LLM modules
+
+Resolves runtime crashes during context processing caused by type mismatches between stored JSON strings and expected dictionary objects.
+---
+ src/llm/prompt_builder.py | 24 ++++++++---
+ src/llm/rag_pipeline.py   | 83 +++++++++++++++++++++++++++++----------
+ 2 files changed, 81 insertions(+), 26 deletions(-)
+
+diff --git a/src/llm/prompt_builder.py b/src/llm/prompt_builder.py
+index 41b9c63..c6b779a 100644
+--- a/src/llm/prompt_builder.py
++++ b/src/llm/prompt_builder.py
+@@ -1,4 +1,5 @@
+ # src/llm/prompt_builder.py
++import json
+ from typing import List, Dict, Any
+ 
+ from src.processing.text_cleaner import normalize_metadata
+@@ -58,7 +59,7 @@ class PromptBuilder:
+         """
+         context_parts = []
+         for i, chunk in enumerate(context_chunks, start=1):
+-            text = chunk["text"]
++            text = str(chunk.get("text") or "")
+             # FIX ('str' object has no attribute 'items'): нормализация типа
+             # metadata (JSON-строка из Chroma/SQLite -> dict) до .get().
+             metadata = normalize_metadata(chunk.get("metadata"))
+@@ -223,7 +224,7 @@ class PromptBuilder:
+         """
+         context_parts = []
+         for i, chunk in enumerate(context_chunks, start=1):
+-            text = self.normalize_ocr_case(chunk["text"])
++            text = self.normalize_ocr_case(str(chunk.get("text") or ""))
+             # FIX ('str' object has no attribute 'items'): metadata чанка из
+             # Chroma/SQLite может быть JSON-строкой — единая нормализация
+             # типа перед любым .get() (включая _format_source ниже).
+@@ -281,13 +282,26 @@ class PromptBuilder:
+ 
+     @staticmethod
+     def _format_history(history: List[Dict[str, str]] = None) -> str:
+-        """Блок предыдущих обменов диалога для user-промпта (может быть пустым)."""
++        """Блок предыдущих обменов диалога для user-промпта (может быть пустым).
++
++        FIX ('str' object has no attribute 'get'): history может содержать
++        JSON-строки вместо dict (дампы SQLite/старые сериализации) — элементы
++        нормализуются на входе, мусор молча отбрасывается вместо падения всего
++        ответа в UI-потоке.
++        """
+         if not history:
+             return ""
+         parts = []
+         for turn in history[-3:]:
+-            q = (turn.get("question") or "").strip()
+-            a = (turn.get("answer") or "").strip()
++            if isinstance(turn, str):
++                try:
++                    turn = json.loads(turn)
++                except (ValueError, TypeError):
++                    continue
++            if not isinstance(turn, dict):
++                continue
++            q = str(turn.get("question") or "").strip()
++            a = str(turn.get("answer") or "").strip()
+             if len(a) > 500:
+                 a = a[:500] + "…"
+             if q:
+diff --git a/src/llm/rag_pipeline.py b/src/llm/rag_pipeline.py
+index 6f4e187..8a5cbce 100644
+--- a/src/llm/rag_pipeline.py
++++ b/src/llm/rag_pipeline.py
+@@ -18,6 +18,7 @@ RAG-пайплайн с навигацией по структуре докум
+ 5. TOC для не-PDF документов (EPUB) берётся из HEADING-блоков в SQLite, а не
+    только через pymupdf (раньше для EPUB оглавление было недоступно).
+ """
++import json
+ import re
+ from collections import defaultdict
+ from difflib import SequenceMatcher
+@@ -29,6 +30,51 @@ from loguru import logger
+ 
+ from src.processing.text_cleaner import normalize_metadata
+ 
++
++def _to_dicts(seq: Any) -> List[Dict[str, Any]]:
++    """Потокобезопасный нормализатор последовательности dict-подобных элементов.
++
++    FIX ('str' object has no attribute 'items'/'get'): исторически контракты
++    модулей (SQLiteStore.expand_graph_context, возвраты ChromaDB, history)
++    допускали ЭЛЕМЕНТЫ-строки — JSON-сериализованные словари (например,
++    metadata рёбер графа, сохранённая через json.dumps). Любой потребитель,
++    вызывающий .get()/.items() на таком элементе, падал с AttributeError уже
++    ПОСЛЕ успешных логов пайплайна (поэтому в логе ошибка appearала позже
++    строк Graph-RAG и склейки чанков). Здесь: dict — passthrough, str/bytes —
++    json.loads (толерантно к одинарным кавычкам), мусор — {}. Ничего не
++    бросаем: тихая деградация лучше падения всего ответа.
++    """
++    out: List[Dict[str, Any]] = []
++    for it in (seq or []):
++        if isinstance(it, dict):
++            out.append(it)
++            continue
++        if isinstance(it, bytes):
++            try:
++                it = it.decode("utf-8", "replace")
++            except Exception:
++                out.append({})
++                continue
++        if isinstance(it, str):
++            s = it.strip()
++            parsed = None
++            try:
++                parsed = json.loads(s)
++            except (ValueError, TypeError):
++                try:
++                    parsed = json.loads(s.replace("'", '"'))
++                except (ValueError, TypeError):
++                    parsed = None
++            if isinstance(parsed, dict):
++                out.append(parsed)
++            elif isinstance(parsed, list):
++                out.extend(d for d in parsed if isinstance(d, dict))
++            else:
++                out.append({})
++            continue
++        out.append({})
++    return out
++
+ from .llm_engine import LLMEngine
+ from .prompt_builder import PromptBuilder
+ from ..storage.sqlite_store import SQLiteStore
+@@ -185,7 +231,12 @@ class RAGPipeline:
+         # FIX (проблема 3 ТЗ): конспект строится по широкой выборке —
+         # 20 релевантных чанков вместо 16, чтобы модели хватило материала
+         # на полный разбор темы (700-1000 слов).
+-        context_chunks = self._hybrid_search(question, query_embedding, k=20)
++        # AUDIT ('str' object has no attribute 'items'): каждый этап конвейера
++        # нормализует тип ЭЛЕМЕНТОВ списка (_to_dicts) — исторически SQLite/
++        # Chroma возвращали JSON-строки вместо dict; .get()/.items() на таком
++        # элементе роняли весь ответ уже ПОСЛЕ логов поиска (как в логе 22:49).
++        context_chunks = _to_dicts(
++            self._hybrid_search(question, query_embedding, k=20))
+ 
+         if not context_chunks:
+             return {"answer": "Не нашёл в библиотеке материалов для конспекта "
+@@ -193,17 +244,17 @@ class RAGPipeline:
+                     "sources": [], "context_chunks": []}
+ 
+         # GRAPH-RAG (Этап 2): раскрываем подграф знаний от точек входа.
+-        context_chunks = self._expand_with_graph(context_chunks)
++        context_chunks = _to_dicts(self._expand_with_graph(context_chunks))
+ 
+         # AUDIT (порядок конвейера): склейка соседних чанков выполняется ПОСЛЕ
+         # графового расширения — иначе добавленные графом вершины (доказательство
+         # к найденной теореме) оставались бы отдельными кусками и модель получала
+         # «нарванный» контекст. Теперь холст склеивается по всей раскрытой
+         # окрестности главы.
+-        context_chunks = self._merge_adjacent_chunks(context_chunks)
++        context_chunks = _to_dicts(self._merge_adjacent_chunks(context_chunks))
+ 
+         messages = self.prompt_builder.build_summary_prompt(
+-            question, context_chunks, history=self.history
++            question, context_chunks, history=_to_dicts(self.history)
+         )
+         answer = self._chat_with_retry(messages)
+         answer = self._strip_code_fences(answer)
+@@ -417,16 +468,16 @@ class RAGPipeline:
+         """
+         try:
+             seeds = []
+-            for ch in chunks[:8]:
++            for ch in _to_dicts(chunks)[:8]:
+                 cid = self._item_id(ch)
+                 if cid:
+                     seeds.append(cid)
+             if not seeds:
+                 return chunks
+ 
+-            extra_nodes = self.sqlite_store.expand_graph_context(
++            extra_nodes = _to_dicts(self.sqlite_store.expand_graph_context(
+                 seed_ids=seeds, max_hops=2, limit=40,
+-            )
++            ))
+             if not extra_nodes:
+                 return chunks
+ 
+@@ -436,27 +487,17 @@ class RAGPipeline:
+             added = 0
+             expanded = list(chunks)
+             for node in extra_nodes:
+-                bid = node["block_id"]
+-                if bid in existing_ids:
++                bid = node.get("block_id") or node.get("chunk_id") or node.get("id")
++                if not bid or bid in existing_ids:
+                     continue
+                 text_len = len(node.get("text") or "")
+                 if total_chars + text_len > budget:
+                     break
+-                meta = node.get("metadata") or {}
+-                # FIX: metadata может быть JSON-строкой из SQLite — приводим
+-                # к dict, иначе ниже/выше по конвейеру падает .get()/.items().
+-                if isinstance(meta, str):
+-                    try:
+-                        import json as _json
+-                        meta = _json.loads(meta) or {}
+-                    except Exception:
+-                        meta = {}
+-                if not isinstance(meta, dict):
+-                    meta = {}
++                meta = normalize_metadata(node.get("metadata"))
+                 item = {
+                     "id": bid,
+                     "chunk_id": bid,
+-                    "text": node["text"],
++                    "text": node.get("text") or "",
+                     "metadata": {
+                         "page_number": node.get("page_number"),
+                         "chapter": node.get("chapter", ""),
+-- 
+2.39.5
+

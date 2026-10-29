@@ -1,0 +1,35 @@
+From e9db57e39bf7a1f0cee98f97913bfc269009d85c Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Tue, 27 Oct 2026 08:58:42 +0000
+Subject: [PATCH 24/25] Add MANIFEST of changed files for manual sync
+
+---
+ _outbox/MANIFEST.txt | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+ create mode 100644 _outbox/MANIFEST.txt
+
+diff --git a/_outbox/MANIFEST.txt b/_outbox/MANIFEST.txt
+new file mode 100644
+index 0000000..e3bc672
+--- /dev/null
++++ b/_outbox/MANIFEST.txt
+@@ -0,0 +1,16 @@
++config.example.yaml
++src/core/settings.py
++src/ingestion/models.py
++src/ingestion/page_renderer.py
++src/ingestion/pdf_parser.py
++src/llm/llm_engine.py
++src/llm/prompt_builder.py
++src/llm/rag_pipeline.py
++src/processing/exporter.py
++src/processing/latex_renderer.py
++src/processing/text_cleaner.py
++src/processing/text_corrector.py
++src/ui/app.py
++src/ui/chat_view.py
++src/ui/layout.py
++src/ui/settings_view.py
+-- 
+2.39.5
+

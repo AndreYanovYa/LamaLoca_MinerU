@@ -1,0 +1,1105 @@
+From 30267cf26e5aa66980e7bf3eb02fbe44d6a9067c Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Tue, 27 Oct 2026 08:40:46 +0000
+Subject: [PATCH 20/25] Ship complete applyable patch bundle 0001-0007 for pull
+ on user machine
+
+---
+ ...dynamic-student-name-customization-f.patch | 490 ++++++++++++++++
+ ...l-architecture-for-robust-technical-.patch | 550 ++++++++++++++++++
+ ...g-in-text_cleaner-docstring-smoke-te.patch |  29 +
+ 3 files changed, 1069 insertions(+)
+ create mode 100644 _outbox/0004-Title-Implement-dynamic-student-name-customization-f.patch
+ create mode 100644 _outbox/0005-Implement-3-level-architecture-for-robust-technical-.patch
+ create mode 100644 _outbox/0007-Fix-SyntaxWarning-in-text_cleaner-docstring-smoke-te.patch
+
+diff --git a/_outbox/0004-Title-Implement-dynamic-student-name-customization-f.patch b/_outbox/0004-Title-Implement-dynamic-student-name-customization-f.patch
+new file mode 100644
+index 0000000..b46949d
+--- /dev/null
++++ b/_outbox/0004-Title-Implement-dynamic-student-name-customization-f.patch
+@@ -0,0 +1,490 @@
++From b65587a8628b2b28f09822d043b18d6e5db98d31 Mon Sep 17 00:00:00 2001
++From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
++Date: Tue, 27 Oct 2026 07:59:11 +0000
++Subject: [PATCH 4/8] Title: Implement dynamic student name customization for
++ BSU FPMI interface
++MIME-Version: 1.0
++Content-Type: text/plain; charset=UTF-8
++Content-Transfer-Encoding: 8bit
++
++Key features implemented:
++- src/core/settings.py: Added `student_name` field to `AppConfig` and root `Settings`, implemented `window_title()` method for dynamic header generation, and added `save_student_name()` utility for persisting changes to YAML config.
++- config.example.yaml: Added `student_name` placeholder under the `app` section.
++- src/ui/app.py: Updated initialization logic to set `page.title` dynamically using `settings.window_title()` and integrated new SettingsView into the application layout.
++- src/ui/chat_view.py: Replaced static welcome banner text with the updated BSU FPMI-specific greeting template.
++- src/ui/settings_view.py: Created new module providing a UI form with `ft.TextField` for editing student full name and save button that updates config and window title instantly.
++- src/ui/layout.py: Extended `MainLayout` to include a third navigation destination ("Настройки") and corresponding container visibility toggling logic.
++---
++ config.example.yaml     |   3 +
++ src/core/settings.py    |  69 +++++++++++++++++++-
++ src/ui/app.py           |  19 +++++-
++ src/ui/chat_view.py     |   7 ++-
++ src/ui/layout.py        |  46 +++++++++++---
++ src/ui/settings_view.py | 136 ++++++++++++++++++++++++++++++++++++++++
++ 6 files changed, 266 insertions(+), 14 deletions(-)
++ create mode 100644 src/ui/settings_view.py
++
++diff --git a/config.example.yaml b/config.example.yaml
++index de3f09e..5480955 100644
++--- a/config.example.yaml
+++++ b/config.example.yaml
++@@ -1,6 +1,9 @@
++ app:
++   name: "lama-loca"
++   language: "ru"
+++  # ТЗ «Кастомизация под студента БГУ ФПМиИ»: Ф.И.О. отображается в заголовке
+++  # окна; редактируется во вкладке Настройки (сохраняется сюда же).
+++  student_name: "Ф.И.О. студента"
++ 
++ storage:
++   root: "data"
++diff --git a/src/core/settings.py b/src/core/settings.py
++index 446555b..1e50e8e 100644
++--- a/src/core/settings.py
+++++ b/src/core/settings.py
++@@ -8,7 +8,7 @@ chunking, external_tools, offline.
++ """
++ from __future__ import annotations
++ 
++-from dataclasses import dataclass, field
+++from dataclasses import dataclass, field, replace
++ from pathlib import Path
++ from typing import Optional
++ 
++@@ -25,6 +25,9 @@ class AppConfig:
++     """Настройки приложения."""
++     name: str = "lama-loca"
++     language: str = "ru"
+++    # ТЗ «Кастомизация под студента БГУ ФПМиИ»: Ф.И.О. студента подставляется
+++    # в динамический заголовок окна (page.title) и редактируется в настройках.
+++    student_name: str = ""
++ 
++ 
++ @dataclass(frozen=True)
++@@ -99,6 +102,9 @@ class Settings:
++     (frozen), что предотвращает случайное изменение конфигурации во время работы.
++     """
++     app: AppConfig = field(default_factory=AppConfig)
+++    # ТЗ п.1: Ф.И.О. студента продублировано на корневом уровне — Settings.load()
+++    # читает его из app.student_name, а UI-код обращается как settings.student_name.
+++    student_name: str = ""
++     storage: StorageConfig = field(default_factory=StorageConfig)
++     ollama: OllamaConfig = field(default_factory=OllamaConfig)
++     search: SearchConfig = field(default_factory=SearchConfig)
++@@ -150,6 +156,21 @@ class Settings:
++         """Путь к исполняемому файлу Tesseract."""
++         return self.external_tools.tesseract_cmd
++ 
+++    # ------------------------------------------------------------------
+++    # ТЗ п.2: динамический заголовок окна
+++    # ------------------------------------------------------------------
+++
+++    def window_title(self) -> str:
+++        """Заголовок окна с Ф.И.О. студента БГУ ФПМиИ.
+++
+++        Используется при старте (src/ui/app.py) и при сохранении настроек
+++        «налету» (src/ui/settings_view.py) без перезапуска приложения.
+++        """
+++        fio = (self.student_name or self.app.student_name or "").strip()
+++        if not fio:
+++            fio = "(Ф.И.О. не указано)"
+++        return f"Lama Loca — личная библиотека студента БГУ ФПМиИ {fio}"
+++
++     # -----------------------------------------------------------------------
++     # Загрузка из YAML
++     # -----------------------------------------------------------------------
++@@ -213,7 +234,9 @@ class Settings:
++             app=AppConfig(
++                 name=app_raw.get("name", "lama-loca"),
++                 language=app_raw.get("language", "ru"),
+++                student_name=str(app_raw.get("student_name", "") or ""),
++             ),
+++            student_name=str(app_raw.get("student_name", "") or ""),
++             storage=StorageConfig(
++                 root=storage_raw.get("root", "data"),
++                 sqlite_path=storage_raw.get("sqlite_path", "data/storage/library.db"),
++@@ -269,12 +292,56 @@ class Settings:
++ 
++         logger.debug(f"Директории хранилища готовы: {root.resolve()}")
++ 
+++    # ------------------------------------------------------------------
+++    # ТЗ п.4: сохранение Ф.И.О. студента в config.yaml («налету»)
+++    # ------------------------------------------------------------------
+++
+++    def save_student_name(self, name: str, config_path: Optional[Path] = None) -> "Settings":
+++        """Записывает student_name в app секцию YAML и возвращает новый Settings.
+++
+++        Config frozen dataclass — мутация запрещена архитектурой, поэтому
+++        обновление конфигурации выполняется перезаписью файла + перезагрузкой
+++        (dataclasses.replace для in-memory копии заголовка делает UI-слой).
+++
+++        Args:
+++            name: Новое Ф.И.О. студента.
+++            config_path: Путь к config.yaml; по умолчанию — storage_root/../config.yaml.
+++
+++        Returns:
+++            Новый объект Settings с обновлённым student_name.
+++        """
+++        if config_path is None:
+++            config_path = Path(self.storage.root).resolve().parent.parent / "config.yaml"
+++        config_path = Path(config_path)
+++        name = str(name or "").strip()
+++
+++        raw: dict = {}
+++        if config_path.exists():
+++            with open(config_path, "r", encoding="utf-8") as f:
+++                raw = yaml.safe_load(f) or {}
+++        app_raw = raw.get("app") or {}
+++        app_raw["student_name"] = name
+++        raw["app"] = app_raw
+++
+++        try:
+++            with open(config_path, "w", encoding="utf-8") as f:
+++                yaml.safe_dump(raw, f, allow_unicode=True, sort_keys=False)
+++            logger.info(f"Сохранён student_name в {config_path}")
+++        except OSError as ex:
+++            logger.warning(f"Не удалось записать config.yaml ({ex}) — применяем только в памяти")
+++
+++        new_app = AppConfig(
+++            name=self.app.name, language=self.app.language, student_name=name,
+++        )
+++        return replace(self, app=new_app, student_name=name)
+++
++     def dump(self) -> dict:
++         """Сериализует настройки обратно в словарь (для отладки)."""
++         return {
++             "app": {
++                 "name": self.app.name,
++                 "language": self.app.language,
+++                "student_name": self.student_name or self.app.student_name,
++             },
++             "storage": {
++                 "root": self.storage.root,
++diff --git a/src/ui/app.py b/src/ui/app.py
++index ef13359..e8487dd 100644
++--- a/src/ui/app.py
+++++ b/src/ui/app.py
++@@ -30,6 +30,7 @@ from src.ui.chat_view import ChatView
++ from src.ui.layout import MainLayout
++ from src.ui.library_view import LibraryView
++ from src.ui.pdf_viewer import PdfViewerView
+++from src.ui.settings_view import SettingsView
++ from src.ui.workers.import_worker import ImportWorker
++ 
++ 
++@@ -55,6 +56,10 @@ class LamaLocaApp:
++                 )
++             settings = Settings.load(resolved)
++ 
+++        # ТЗ п.4: запоминаем, откуда загружен конфиг — настройки сохраняются
+++        # именно в этот файл (а не в CWD).
+++        self.config_path = config_path if config_path is not None else resolved
+++
++         if paths is None:
++             # storage_root возвращает str — приводим к Path явно.
++             paths = Paths(Path(settings.storage_root))
++@@ -73,7 +78,9 @@ class LamaLocaApp:
++         settings = self.settings
++ 
++         # --- Параметры окна ---
++-        page.title = "Lama Loca — личная библиотека ПМИ"
+++        # ТЗ п.2: динамический заголовок с Ф.И.О. студента БГУ ФПМиИ
+++        # (берётся из settings.student_name; при пустом значении — «не указано»).
+++        page.title = settings.window_title()
++         page.window.width = 1400
++         page.window.height = 900
++         page.window.min_width = 1000
++@@ -158,6 +165,15 @@ class LamaLocaApp:
++         )
++         self.chat_view = chat_view
++ 
+++        # ТЗ п.4: вкладка «Настройки» (Ф.И.О. студента) + обновление заголовка
+++        # окна налету после сохранения (page.title обновляет и сам SettingsView).
+++        settings_view = SettingsView(
+++            page, settings,
+++            config_path=getattr(self, "config_path", None),
+++            on_settings_saved=lambda new_settings: setattr(self, "settings", new_settings),
+++        )
+++        self.settings_view = settings_view
+++
++         # Крестик «Закрыть просмотр» → освобожаем ресурс документа и
++         # возвращаем библиотеку в исходное состояние (только список книг).
++         self.layout.on_viewer_closed = lambda: viewer.close_document()
++@@ -167,6 +183,7 @@ class LamaLocaApp:
++             chat=chat_view.build(),
++             library=library_view.build(),
++             viewer=viewer.build(),
+++            settings=settings_view.build(),
++         )
++         self.layout.mount()
++ 
++diff --git a/src/ui/chat_view.py b/src/ui/chat_view.py
++index 4b27c71..dbc94c9 100644
++--- a/src/ui/chat_view.py
+++++ b/src/ui/chat_view.py
++@@ -587,9 +587,10 @@ class ChatView:
++         self.active_doc_text = ft.Text("", size=12, color=ft.Colors.GREY)
++ 
++         self._add_system_message(
++-            "👋 Привет! Яlama Loca — помощник по ПМИ.\n"
++-            "Загрузите книгу во вкладке **Библиотека** и задайте вопрос.\n"
++-            "Например: *покажи оглавление* или *что такое равномерная сходимость?*"
+++            # ТЗ п.3: новый текст стартового баннера строго по шаблону.
+++            "👋 Привет! Яlama Loca — помощник по твоим учебным дисциплинам. "
+++            "Загрузите книгу во вкладке Библиотека и задайте вопрос. "
+++            "Например: покажи оглавление или что такое равномерная сходимость?"
++         )
++ 
++     def build(self) -> ft.Control:
++diff --git a/src/ui/layout.py b/src/ui/layout.py
++index c50bdcd..4ba178f 100644
++--- a/src/ui/layout.py
+++++ b/src/ui/layout.py
++@@ -48,6 +48,7 @@ class MainLayout:
++         self.chat_content: Optional[ft.Control] = None
++         self.library_content: Optional[ft.Control] = None
++         self.viewer_content: Optional[ft.Control] = None
+++        self.settings_content: Optional[ft.Control] = None
++ 
++         # Навигационные колбэки (опциональны).
++         self.on_viewer_closed: Optional[Callable[[], None]] = None
++@@ -116,8 +117,18 @@ class MainLayout:
++             visible=False,          # библиотека скрыта, пока не выбрана вкладка
++         )
++ 
+++        # ТЗ п.4: контейнер вкладки «Настройки» (Ф.И.О. студента). Светлая тема —
+++        # как у библиотеки; видимость только по флагу (принципы layout сохранены).
+++        self.settings_container = ft.Container(
+++            content=self._placeholder("Настройки загружаются…"),
+++            expand=True,
+++            visible=False,
+++            bgcolor="#FAFAFA",
+++            padding=10,
+++        )
+++
++         self.main_area = ft.Column(
++-            [self.chat_container, self.library_row],
+++            [self.chat_container, self.library_row, self.settings_container],
++             expand=True,
++             spacing=0,
++         )
++@@ -142,6 +153,12 @@ class MainLayout:
++                     selected_icon=ft.Icons.LIBRARY_BOOKS,
++                     label="Библиотека",
++                 ),
+++                # ТЗ п.4: доступ к форме настроек (Ф.И.О. студента).
+++                ft.NavigationRailDestination(
+++                    icon=ft.Icons.SETTINGS_OUTLINED,
+++                    selected_icon=ft.Icons.SETTINGS,
+++                    label="Настройки",
+++                ),
++             ],
++             on_change=self._on_nav_change,
++         )
++@@ -160,14 +177,18 @@ class MainLayout:
++     # Внедрение контента (вызывается один раз из app.py)
++     # ------------------------------------------------------------------
++ 
++-    def attach(self, chat: ft.Control, library: ft.Control, viewer: ft.Control):
+++    def attach(self, chat: ft.Control, library: ft.Control, viewer: ft.Control,
+++               settings: Optional[ft.Control] = None):
++         """Кладёт готовые вьюхи в контейнеры каркаса."""
++         self.chat_content = chat
++         self.library_content = library
++         self.viewer_content = viewer
+++        self.settings_content = settings
++         self.chat_container.content = chat
++         self.library_container.content = library
++         self.viewer_body.content = viewer
+++        if settings is not None:
+++            self.settings_container.content = settings
++ 
++     def mount(self):
++         """Добавляет каркас на страницу и применяет начальное состояние."""
++@@ -188,13 +209,11 @@ class MainLayout:
++                 logger.warning(f"on_view_changed: {ex}")
++ 
++     def _apply_view(self, index: int):
++-        """index 0 → чат на всё пространство; 1 → библиотека."""
++-        if index == 0:
++-            self.chat_container.visible = True
++-            self.library_row.visible = False
++-        else:
++-            self.chat_container.visible = False
++-            self.library_row.visible = True
+++        """index 0 → чат на всё пространство; 1 → библиотека; 2 → настройки."""
+++        self.chat_container.visible = (index == 0)
+++        self.library_row.visible = (index == 1)
+++        # ТЗ п.4: третья вкладка — форма настроек (Ф.И.О. студента).
+++        self.settings_container.visible = (index == 2)
++         self._safe_update()
++ 
++     def show_chat(self):
++@@ -205,6 +224,10 @@ class MainLayout:
++         self.rail.selected_index = 1
++         self._apply_view(1)
++ 
+++    def show_settings(self):
+++        self.rail.selected_index = 2
+++        self._apply_view(2)
+++
++     # --- Панель документа -------------------------------------------------
++ 
++     @property
++@@ -218,6 +241,11 @@ class MainLayout:
++         главе, запрос контекста документа из чата.
++         """
++         was_closed = not self.viewer_container.visible
+++        # Если пользователь открыл просмотр из вкладки «Настройки» —
+++        # корректно переключаемся на библиотеку (rail.selected_index=1),
+++        # иначе settings-контейнер остался бы видимым под библиотекой.
+++        if self.settings_container.visible:
+++            self.rail.selected_index = 1
++         if switch_to_library:
++             self.show_library()
++         self.library_row.visible = True
++diff --git a/src/ui/settings_view.py b/src/ui/settings_view.py
++new file mode 100644
++index 0000000..4f86aad
++--- /dev/null
+++++ b/src/ui/settings_view.py
++@@ -0,0 +1,136 @@
+++# src/ui/settings_view.py
+++"""
+++Вкладка «Настройки» Lama Loca (Flet 1.x).
+++
+++ТЗ «Кастомизация интерфейса под студента БГУ ФПМиИ», п.4:
+++* Поле ft.TextField(label="Ф.И.О. студента", value=settings.student_name).
+++* Сохранение по кнопке «Сохранить»: запись в config.yaml через
+++  Settings.save_student_name() (frozen dataclass — возвращается новый
+++  экземпляр, мутаций нет), мгновенное обновление page.title главного окна
+++  без перезапуска приложения.
+++
+++Архитектура сохранена: модуль ничего не знает о RAG/LLM, только UI + Settings.
+++"""
+++from __future__ import annotations
+++
+++from pathlib import Path
+++from typing import Callable, Optional
+++
+++import flet as ft
+++from loguru import logger
+++
+++from src.core.settings import Settings
+++
+++
+++def window_title_for(settings: Settings) -> str:
+++    """Единая точка форматирования заголовка окна (используется app.py и здесь)."""
+++    return settings.window_title()
+++
+++
+++class SettingsView:
+++    """Форма настроек: Ф.И.О. студента + сохранение конфигурации."""
+++
+++    def __init__(
+++        self,
+++        page: ft.Page,
+++        settings: Settings,
+++        config_path: Optional[Path] = None,
+++        on_settings_saved: Optional[Callable[[Settings], None]] = None,
+++    ):
+++        self.page = page
+++        self.settings = settings
+++        self.config_path = config_path
+++        self.on_settings_saved = on_settings_saved
+++
+++        self.fio_field = ft.TextField(
+++            label="Ф.И.О. студента",
+++            hint_text="Например: Иванов И. И.",
+++            value=settings.student_name or settings.app.student_name or "",
+++            width=420,
+++            border_radius=8,
+++        )
+++
+++        self.status_text = ft.Text("", size=12, color=ft.Colors.GREY)
+++
+++        self.save_btn = ft.FilledButton(
+++            icon=ft.Icons.SAVE,
+++            content=ft.Text("Сохранить"),
+++            bgcolor="#2196F3",
+++            color="white",
+++            on_click=self._on_save,
+++        )
+++
+++    # ------------------------------------------------------------------
+++
+++    def build(self) -> ft.Control:
+++        return ft.Container(
+++            content=ft.Column(
+++                [
+++                    ft.Text("⚙️ Настройки", size=20, weight=ft.FontWeight.BOLD),
+++                    ft.Divider(color="#DDDDDD"),
+++                    ft.Text(
+++                        "Персонализация интерфейса",
+++                        size=14,
+++                        weight=ft.FontWeight.W_500,
+++                    ),
+++                    ft.Text(
+++                        "Ф.И.О. студента отображается в заголовке окна "
+++                        "приложения (БГУ, ФПМиИ).",
+++                        size=12,
+++                        color=ft.Colors.GREY_700,
+++                    ),
+++                    self.fio_field,
+++                    ft.Row([self.save_btn, self.status_text], spacing=12),
+++                ],
+++                spacing=14,
+++                expand=True,
+++            ),
+++            padding=20,
+++            expand=True,
+++        )
+++
+++    # ------------------------------------------------------------------
+++
+++    def _on_save(self, e):
+++        new_name = (self.fio_field.value or "").strip()
+++        try:
+++            # frozen-конфиг: save_student_name пишет app.student_name в
+++            # config.yaml и возвращает НОВЫЙ Settings (без мутаций).
+++            updated = self.settings.save_student_name(new_name, self.config_path)
+++        except Exception as ex:  # pragma: no cover - disk errors
+++            logger.error(f"Не удалось сохранить настройки: {ex}")
+++            self._set_status(f"Ошибка сохранения: {ex}", ok=False)
+++            return
+++
+++        self.settings = updated
+++
+++        # Мгновенно обновляем заголовок окна «налету», без перезапуска.
+++        try:
+++            self.page.title = updated.window_title()
+++            self.page.update()
+++        except Exception as ex:  # pragma: no cover
+++            logger.warning(f"page.title update failed: {ex}")
+++
+++        if self.on_settings_saved:
+++            try:
+++                self.on_settings_saved(updated)
+++            except Exception as ex:  # pragma: no cover
+++                logger.warning(f"on_settings_saved: {ex}")
+++
+++        self._set_status(
+++            "Сохранено ✔ заголовок окна обновлён" if new_name
+++            else "Сохранено ✔ (Ф.И.О. пустое — в заголовке «не указано»)",
+++            ok=True,
+++        )
+++        logger.info(f"Настройки сохранены: student_name={new_name!r}")
+++
+++    def _set_status(self, text: str, ok: bool):
+++        self.status_text.value = text
+++        self.status_text.color = ft.Colors.GREEN_600 if ok else ft.Colors.RED_400
+++        try:
+++            self.status_text.update()
+++        except Exception:
+++            try:
+++                self.page.update()
+++            except Exception:
+++                pass
++-- 
++2.39.5
++
+diff --git a/_outbox/0005-Implement-3-level-architecture-for-robust-technical-.patch b/_outbox/0005-Implement-3-level-architecture-for-robust-technical-.patch
+new file mode 100644
+index 0000000..0e141ec
+--- /dev/null
++++ b/_outbox/0005-Implement-3-level-architecture-for-robust-technical-.patch
+@@ -0,0 +1,550 @@
++From e7af92e3eed856ccbbf375c3a0243b7b12a4f18e Mon Sep 17 00:00:00 2001
++From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
++Date: Tue, 27 Oct 2026 08:23:26 +0000
++Subject: [PATCH 5/8] Implement 3-level architecture for robust technical
++ literature processing to eliminate raw LaTeX in Flet UI -
++ src/ingestion/pdf_parser.py: Switched text extraction to block mode
++ (get_text("blocks")) to prevent formula fragmentation; added lazy PNG
++ rendering trigger for complex graphics zones -
++ src/ingestion/page_renderer.py: New module for high-resolution PNG rendering
++ of PDF page zones when text layer is unreadable - src/llm/prompt_builder.py:
++ Updated system prompts to enforce strict separation: inline math as pure
++ Unicode, heavy formulas in $$...$$ blocks, and code in Markdown fences -
++ src/ui/chat_view.py & workers: Configured ft.Markdown with GITHUB_WEB
++ extension set and added pre-processing logic to wrap unsupported formula
++ blocks in monospaced containers - src/processing/text_cleaner.py: Added
++ latex_inline_to_unicode converter to strip raw LaTeX commands from context
++ before LLM ingestion
++
++---
++ src/ingestion/models.py        |   1 +
++ src/ingestion/page_renderer.py |  81 ++++++++++++++++++++
++ src/ingestion/pdf_parser.py    | 136 +++++++++++++++++++++++++++++----
++ src/llm/prompt_builder.py      |  82 ++++++++++++--------
++ src/processing/text_cleaner.py |  76 ++++++++++++++++++
++ 5 files changed, 333 insertions(+), 43 deletions(-)
++ create mode 100644 src/ingestion/page_renderer.py
++
++diff --git a/src/ingestion/models.py b/src/ingestion/models.py
++index 5b48bc7..490336d 100644
++--- a/src/ingestion/models.py
+++++ b/src/ingestion/models.py
++@@ -10,6 +10,7 @@ class BlockType(str, Enum):
++     FORMULA = "formula"
++     CODE = "code"
++     TABLE = "table"
+++    FIGURE = "figure"  # Level 1 ТЗ: ленивый PNG-рендер зоны со сложной графикой
++ 
++ class IngestionStatus(str, Enum):
++     PENDING = "pending"
++diff --git a/src/ingestion/page_renderer.py b/src/ingestion/page_renderer.py
++new file mode 100644
++index 0000000..411ab5a
++--- /dev/null
+++++ b/src/ingestion/page_renderer.py
++@@ -0,0 +1,81 @@
+++# src/ingestion/page_renderer.py
+++"""Ленивый рендеринг зон страницы PDF в PNG (Level 1 архитектуры ТЗ).
+++
+++Когда текстовый слой PyMuPDF склеивает встроенную сложную графику
+++(формулы-картинки, схемы, сплющенные LaTeX-блоки) в нечитаемую «кашу»,
+++парсер активирует этот модуль: зона блока вырезается и рендерится в PNG
+++высокого разрешения. Текст при этом НЕ выбрасывается — векторный поиск
+++продолжает работать по текстовому слою, PNG служит зрительным слоем для
+++viewer'а.
+++
+++Модуль ленивый: импортируется и вызывается только при срабатывании
+++детектора «каши» в pdf_parser, а не на каждой странице.
+++"""
+++from pathlib import Path
+++from typing import Iterable, Optional, Tuple
+++
+++from loguru import logger
+++
+++Rect = Tuple[float, float, float, float]
+++
+++# Кэш уже отрендеренных зон: (pdf_path, page_num, rect) -> str(png path).
+++# Потокобезопасен для нашего однопоточного импорта; dict-запись атомарна в CPython.
+++_ZONE_CACHE: dict = {}
+++
+++
+++def _safe_dir(out_dir: Path) -> Path:
+++    out_dir = Path(out_dir)
+++    out_dir.mkdir(parents=True, exist_ok=True)
+++    return out_dir
+++
+++
+++def render_zone_png(page, rect: Rect, out_dir: Path, filename: str,
+++                    dpi: int = 300) -> Optional[str]:
+++    """Рендерит прямоугольную зону страницы в PNG. Возвращает путь или None.
+++
+++    page:   pymupdf.Page
+++    rect:   (x0, y0, x1, y1) в координатах страницы (points)
+++    """
+++    try:
+++        import pymupdf  # локальный импорт: модуль опционален для EPUB-пайплайна
+++    except ImportError:
+++        logger.debug("PyMuPDF недоступен — ленивый PNG пропущен")
+++        return None
+++
+++    key = (str(getattr(getattr(page, "parent", None), "name", "")),
+++           getattr(page, "number", -1), tuple(round(v, 1) for v in rect))
+++    if key in _ZONE_CACHE:
+++        return _ZONE_CACHE[key]
+++
+++    try:
+++        x0, y0, x1, y1 = rect
+++        clip = pymupdf.Rect(max(x0 - 2, 0), max(y0 - 2, 0), x1 + 2, y1 + 2)
+++        zoom = dpi / 72.0
+++        mat = pymupdf.Matrix(zoom, zoom)
+++        pix = page.get_pixmap(matrix=mat, clip=clip, alpha=False)
+++        out_path = _safe_dir(Path(out_dir)) / filename
+++        pix.save(str(out_path))
+++        _ZONE_CACHE[key] = str(out_path)
+++        logger.debug(f"Зона стр. {key[1]} отрендерена в {out_path.name} ({dpi} dpi)")
+++        return str(out_path)
+++    except Exception as e:  # noqa: BLE001 — визуальный fallback не роняет импорт
+++        logger.debug(f"Ленивый PNG зоны не выполнен: {e}")
+++        return None
+++
+++
+++def render_page_png(page, out_dir: Path, filename: str,
+++                    dpi: int = 200) -> Optional[str]:
+++    """Рендер всей страницы в PNG (используется OCR-fallback и viewer'ом)."""
+++    try:
+++        import pymupdf
+++    except ImportError:
+++        return None
+++    try:
+++        zoom = dpi / 72.0
+++        pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
+++        out_path = _safe_dir(Path(out_dir)) / filename
+++        pix.save(str(out_path))
+++        return str(out_path)
+++    except Exception as e:  # noqa: BLE001
+++        logger.debug(f"PNG страницы не выполнен: {e}")
+++        return None
++diff --git a/src/ingestion/pdf_parser.py b/src/ingestion/pdf_parser.py
++index 643658f..899ceda 100644
++--- a/src/ingestion/pdf_parser.py
+++++ b/src/ingestion/pdf_parser.py
++@@ -187,31 +187,141 @@ class PDFParser(BaseParser):
++         return blocks, page_texts
++ 
++     def _extract_page_blocks(self, page: pymupdf.Page, page_num: int, start_block_id: int) -> list:
++-        """Извлекает блоки со страницы (стандартная логика)."""
+++        """Извлекает блоки со страницы в РЕЖИМЕ БЛОЧНОЙ СБОРКИ (Level 1 ТЗ).
+++
+++        FIX (разрыв формул и индексов): раньше использовался dict-обход с
+++        TEXT_PRESERVE_WHITESPACE, где each span жил отдельно — верхние/нижние
+++        индексы и разнесённые по baseline фрагменты формул PyMuPDF резал на
+++        отдельные «строки», которые затем склеивались в кашу. Теперь страница
+++        собирается методом get_text("blocks") — фреймворк сам группирует
+++        строки в логические текстовые блоки по геометрической близости, и
+++        формула остаётся монолитной.
+++
+++        Если блок содержит встроенную сложную графику (изображения-формулы,
+++        type==1) или его текст не читается (OCR-мусор/сплющенные формулы),
+++        активируется ленивый рендер зоны блока в PNG через page_renderer
+++        (src/ingestion/page_renderer.py) — как заложено архитектурой проекта.
+++        """
++         blocks = []
++-        page_dict = page.get_text("dict", flags=pymupdf.TEXT_PRESERVE_WHITESPACE)
++-        
++-        for block_idx, block in enumerate(page_dict.get("blocks", [])):
++-            if block.get("type") == 1:  # изображение
+++        # --- Level 1: блочная сборка вместо span-level dict-обхода ---
+++        raw_blocks = page.get_text("blocks", flags=pymupdf.TEXT_PRESERVE_WHITESPACE)
+++        img_zones = self._image_zones(page)
+++
+++        for block_idx, rb in enumerate(raw_blocks):
+++            # rb: (x0, y0, x1, y1, text, block_no, block_type)
+++            x0, y0, x1, y1, text, _bno, btype = rb[:7]
+++            if btype == 1:  # чистое изображение — зона обработана ниже
++                 continue
++-            
++-            bbox = block.get("bbox", [0, 0, 0, 0])
++-            coordinates = {"x0": round(bbox[0], 2), "y0": round(bbox[1], 2), "x1": round(bbox[2], 2), "y1": round(bbox[3], 2)}
++-            
++-            block_text, block_type = self._classify_text_block(block)
++-            if not block_text.strip():
+++
+++            block_text = re.sub(r"\n{3,}", "\n\n", (text or "").strip())
+++            if not block_text:
++                 continue
++-            
+++
+++            coordinates = {"x0": round(x0, 2), "y0": round(y0, 2),
+++                           "x1": round(x1, 2), "y1": round(y1, 2)}
+++
+++            # Блочный режим даёт группы строк; заголовок — короткий блок с
+++            # большой высотой строки (эвристика bbox вместо span.size).
+++            block_type = self._classify_bbox_block(block_text, y1 - y0)
+++
+++            method = "pymupdf_blocks"
+++            zone_png = None
+++            # Сложная графика/формулы внутри или рядом с блоком → ленивый PNG.
+++            if self._block_has_math_garbage(block_text) or \
+++                    self._zone_intersects(img_zones, (x0, y0, x1, y1)):
+++                zone_png = self._render_zone_lazy(page, (x0, y0, x1, y1), page_num, block_idx)
+++                if zone_png is not None:
+++                    method = "pymupdf_blocks+zone_png"
+++
++             blocks.append(DocumentBlock(
++                 block_id=f"b{start_block_id + block_idx}",
++                 block_type=block_type,
++                 text=block_text,
++                 page_number=page_num + 1,
++                 coordinates=coordinates,
++-                extraction_method="pymupdf",
+++                extraction_method=method,
++             ))
+++            if zone_png is not None:
+++                # PNG-копия «каши» идёт отдельным блоком: векторный поиск
+++                # по тексту остаётся, а зрительный слой доступен viewer'у.
+++                blocks.append(DocumentBlock(
+++                    block_id=f"b{start_block_id + block_idx}z",
+++                    block_type=BlockType.FIGURE,
+++                    text="",
+++                    page_number=page_num + 1,
+++                    coordinates=coordinates,
+++                    extraction_method="lazy_png:" + zone_png,
+++                ))
++         return blocks
++ 
+++    # ------------------------------------------------------------------
+++    # Level 1 helpers: геометрия изображений, детект «каши», ленивый PNG
+++    # ------------------------------------------------------------------
+++    @staticmethod
+++    def _image_zones(page: pymupdf.Page) -> list:
+++        """Прямоугольники встроенных изображений на странице (для пересечений)."""
+++        zones = []
+++        try:
+++            for info in page.get_image_info():
+++                bb = info.get("bbox")
+++                if bb:
+++                    zones.append(tuple(bb))
+++        except Exception:  # pragma: no cover - повреждённый PDF
+++            pass
+++        return zones
+++
+++    @staticmethod
+++    def _zone_intersects(zones: list, rect: tuple, eps: float = 2.0) -> bool:
+++        x0, y0, x1, y1 = rect
+++        for zx0, zy0, zx1, zy1 in zones:
+++            if zx0 < x1 - eps and zx1 > x0 + eps and zy0 < y1 - eps and zy1 > y0 + eps:
+++                return True
+++        return False
+++
+++    @staticmethod
+++    def _block_has_math_garbage(text: str) -> bool:
+++        """Блок похож на склейку формул/графики в кашу текстовым слоем.
+++
+++        Признаки: плотная смесь одиночных латинских букв, операторов и цифр
+++        без слов (сплющенные формулы), либо обилие замусоренных скобок.
+++        """
+++        if not text:
+++            return False
+++        letters = sum(ch.isalpha() and ch.isascii() for ch in text)
+++        words = len(re.findall(r"[A-Za-zА-Яа-яЁё]{4,}", text))
+++        ops = len(re.findall(r"[∑∫∏√⊂⊆∈∀∃≤≥≠±×÷^_{}]", text))
+++        digits = sum(ch.isdigit() for ch in text)
+++        dense = letters + digits + ops
+++        if dense == 0:
+++            return False
+++        # «каша»: много изолированных символов при почти полном отсутствии слов
+++        return words == 0 and dense >= 12 and ops >= 2
+++
+++    def _render_zone_lazy(self, page: pymupdf.Page, rect: tuple,
+++                          page_num: int, block_idx: int):
+++        """Ленивый рендер зоны блока в PNG (300 dpi) через page_renderer.
+++
+++        Возвращает путь к PNG или None, если модуль недоступен/ошибка —
+++        импорт никогда не роняется из-за визуального fallback-слоя.
+++        """
+++        try:
+++            from .page_renderer import render_zone_png  # ленивый импорт
+++            out_dir = Path(page.parent.name).parent / (
+++                Path(page.parent.name).stem + "_zones")
+++            return render_zone_png(page, rect, out_dir,
+++                                   f"p{page_num + 1}_b{block_idx}.png", dpi=300)
+++        except Exception as e:  # noqa: BLE001 — деградация допустима
+++            logger.debug(f"Ленивый PNG зоны (стр. {page_num + 1}) пропущен: {e}")
+++            return None
+++
+++    @staticmethod
+++    def _classify_bbox_block(text: str, height: float) -> BlockType:
+++        """Тип блока по геометрии bbox (замена span-size эвристики)."""
+++        lines = [l for l in text.split("\n") if l.strip()]
+++        if height > 60 and len(text) < 150 and len(lines) <= 2:
+++            return BlockType.HEADING
+++        return BlockType.TEXT
+++
++     def _classify_text_block(self, block: dict) -> tuple:
++         """Определяет тип блока."""
++         full_text_parts = []
++diff --git a/src/llm/prompt_builder.py b/src/llm/prompt_builder.py
++index c6b779a..acb7103 100644
++--- a/src/llm/prompt_builder.py
+++++ b/src/llm/prompt_builder.py
++@@ -27,12 +27,16 @@ class PromptBuilder:
++ 8. Текст учебника может быть в ВЕРХНЕМ РЕГИСТРЕ или без форматирования (OCR/скан) —
++    всегда приводи его к нормальному регистру и оформляй markdown-структурой
++    (заголовки ### , списки - , определения **жирным**).
++-9. МАТЕМАТИЧЕСКАЯ КОРРЕКТНОСТЬ (предел функции по Коши): ЗАПРЕЩЕНО писать
++-   $X \setminus O(x_0)$ / $X \setminus U(x_0)$ — разность с окрестностью
+++9. Формат математики: инлайн — только чистый Unicode без слэшей и $,
+++   \\(...\\) и \\[...\\] (пример: ∀x ∈ ℝ, A ⊆ B, x₀ → x); тяжёлые формулы —
+++   изолированные блоки $$...$$ (LaTeX разрешён только внутри них); код —
+++   ```python ... ``` с указанием языка.
+++10. МАТЕМАТИЧЕСКАЯ КОРРЕКТНОСТЬ (предел функции по Коши): ЗАПРЕЩЕНО писать
+++   X \\ O(x₀) / X \\ U(x₀) (и LaTeX-формы \\setminus) — разность с окрестностью
++    означает «все точки, КРОМЕ окрестности» и переворачивает смысл. Только
++-   ПРОКОЛОТАЯ окрестность: $x \in \dot{O}(x_0)$ либо
++-   $x \in O(x_0) \setminus \{x_0\}$; квантор всеобщности — только по точкам
++-   внутри неё: $\forall x \in \dot{O}(x_0) \cap X$.
+++   ПРОКОЛОТАЯ окрестность: инлайн — чистый Unicode x ∈ Ȯ(x₀)
+++   либо x ∈ O(x₀) \\ {x₀}, квантор всеобщности — только по точкам
+++   внутри неё: ∀x ∈ Ȯ(x₀) ∩ X; LaTeX-формы backslash-in / backslash-dot — только внутри $$-блоков.
++ 
++ ОСОБЫЙ РЕЖИМ ДЛЯ ОГЛАВЛЕНИЙ:
++ Если пользователь просит показать оглавление, содержание или структуру книги:
++@@ -99,7 +103,8 @@ class PromptBuilder:
++ Ответь на вопрос, используя ТОЛЬКО информацию из контекста выше. Укажи номера источников в квадратных скобках, например [1], [2].
++ 
++ Требования к полноте (ты готовишь студента ПМИ к экзамену):
++-- Раскрой тему максимально полно: определения — дословно точными формулировками из учебника с обозначениями и LaTeX ($...$); теоремы — с условиями, выводами и идеей доказательства, если оно есть в контексте.
+++- Раскрой тему максимально полно: определения — дословно точными формулировками из учебника с обозначениями; теоремы — с условиями, выводами и идеей доказательства, если оно есть в контексте.
+++- Формат математики (универсальный, для технической литературы): инлайн-символы и короткие выражения внутри предложений пиши ЧИСТЫМ ЮНИКОДОМ без слэшей и LaTeX-команд (x₀, ∀x ∈ ℝ, A ⊆ B, aₙ → a); тяжёлые формулы и уравнения выделяй изолированными блоками $$...$$ (внутри — LaTeX). Блоки кода — только Markdown-ограждения с языком (```python ... ```).
++ - Структурируй ответ заголовками ### и списками; ключевые термины — **жирным**.
++ - Если в контексте есть связанные понятия (предыдущие определения, леммы, замечания автора) — включи их: ответ должен читаться как цельный конспект, а не как выдержка.
++ - Не сокращай: лучше подробный полный ответ, чем краткая выжимка. Доводи все разделы до конца."""
++@@ -116,15 +121,25 @@ class PromptBuilder:
++ ЖЁСТКИЕ ТРЕБОВАНИЯ К ФОРМАТУ ОТВЕТА:
++ 1. Markdown-разметка обязательна: заголовки ## и ###, маркированные списки (- ),
++    нумерованные списки (1. ), **жирный шрифт для терминов**, *курсив* для акцентов.
++-2. Математика — только LaTeX: инлайн $x \\in A$, $\\forall x \\exists y$,
++-   отдельные формулы строкой $$\\lim_{x \\to 0} \\frac{\\sin x}{x} = 1$$.
++-   НИКОГДА не пиши формулы «плоским» текстом вроде lim x->0 или x ∈ A без знаков $.
+++2. Формат математики (УНИВЕРСАЛЬНЫЙ стандарт для технической литературы —
+++   Математика/Физика/Программирование; полностью исключает сырой LaTeX в UI):
+++   а) ИНЛАЙН — внутри предложений ОБЯЗАНА писать ИСКЛЮЧИТЕЛЬНО чистым
+++      Unicode, БЕЗ слэшей и LaTeX-команд: «Рассмотрим окрестность точки x₀,
+++      где ∀x ∈ ℝ выполняется |f(x) − A| < ε», «A ⊆ B», «aₙ → a».
+++      ЗАПРЕЩЕНО инлайн-формы $...$, \\(...\\), \\\\forall, \\\\in, \\\\dot{O} и т.п.
+++   б) ТЯЖЁЛЫЕ формулы и уравнения — ТОЛЬКО изолированными блоками на
+++      отдельной строке в двойных долларах:
+++      $$\\sum_{k=1}^{n} a_k = a_1 + a_2 + \\dots + a_n$$
+++      Внутри таких блоков допускается полноценный LaTeX.
+++   в) БЛОКИ КОДА (Физика/Программирование) — строго Markdown-ограждения
+++      с указанием языка: ```python ... ``` / ```cpp ... ```.
+++   Никаких других форм записи математики не существует.
++ 3. Для перечислений (операции над множествами, логические связки, свойства,
++    таблицы истинности, классификации) ОБЯЗАТЕЛЬНО создавай Markdown-таблицы
++    с выравниванием колонок, например:
++    | Операция | Обозначение | Определение |
++    |---|---|---|
++-   | Объединение | $A \\cup B$ | $\\{x : x \\in A \\lor x \\in B\\}$ |
+++   | Объединение | A ∪ B | {x : x ∈ A ∨ x ∈ B} |
++ 4. После каждого утверждения ставь ссылку на источник в квадратных скобках [1], [2].
++    REFACTORING (ТЗ п.4): для КЛЮЧЕВЫХ мест (определения, теоремы, формулы,
++    главные посылы автора) используй интерактивный формат ссылки на страницу:
++@@ -155,9 +170,10 @@ class PromptBuilder:
++    Ориентируйся на объём первоисточника: если контекст содержит 10 пунктов,
++    в конспекте должно быть 10 раскрытых пунктов, а не 3. Доводи каждый
++    раздел до логического завершения; обрывать мысль запрещено.
++-10. Формулы пиши ТОЛЬКО в знаках $...$ (инлайн) или $$...$$ (отдельной
++-    строкой). ЗАПРЕЩЕНО выводить технические маркеры вида {{FORMULA:N}},
++-    <formula> и прочую разметку — только чистый LaTeX в долларах.
+++10. Инлайн-математика — ТОЛЬКО чистый Unicode без $ и слэшей (см. п.2а);
+++    тяжёлые формулы — изолированные блоки $$...$$ на отдельной строке.
+++    ЗАПРЕЩЕНО выводить технические маркеры вида {{FORMULA:N}},
+++    \\(...\\), \\[...\\], <formula> и прочую разметку.
++ 11. Эталонный пример ниже — образец СТРУКТУРЫ, а не содержимого: не копируй
++     из него формулы и примеры, если они не относятся к теме вопроса.
++ 12. GRAPH-RAG: если перед текстом фрагмента контекста стоит метка типа
++@@ -174,11 +190,12 @@ class PromptBuilder:
++    разность множества с окрестностью означает «ВСЕ точки, КРОМЕ окрестности»
++    — это переворачивает смысл определения и является грубой ошибкой анализа.
++    Определение предела в терминах окрестностей должно использовать
++-   ИСКЛЮЧИТЕЛЬНО понятие ПРОКОЛОТОЙ окрестности точки. Записывай её строго:
++-   $x \\in \\dot{O}(x_0)$ либо $x \\in O(x_0) \\setminus \\{x_0\\}$.
+++   ИСКЛЮЧИТЕЛЬНО понятие ПРОКОЛОТОЙ окрестности точки. Инлайн (п.2а)
+++   записывай её чистым юникодом: x ∈ Ȯ(x₀) либо x ∈ O(x₀) \\ {x₀}.
+++   В тяжёлых блоках $$...$$ — LaTeX: x \\in \\dot{O}(x_0).
++    Контролируй логику кванторов: квантор всеобщности по x применяется только
++    к точкам ВНУТРИ проколотой окрестности аргумента:
++-   $\\forall x \\in \\dot{O}(x_0) \\cap X$.
+++   ∀x ∈ Ȯ(x₀) ∩ X (инлайн) / \\forall x \\in \\dot{O}(x_0) \\cap X (в $$-блоке).
++    Эталон корректной формулировки (смысл, не дословное копирование):
++    $$\\lim_{x \\to x_0} f(x) = A \\iff \\forall \\varepsilon > 0 \\;
++    \\exists \\delta > 0 \\; \\forall x \\in \\dot{U}_\\delta(x_0)
++@@ -193,14 +210,15 @@ class PromptBuilder:
++ ### Основные операции
++ | Операция | Обозначение | Определение | Пример |
++ |---|---|---|---|
++-| Объединение | $A \\cup B$ | $\\{x : x \\in A \\lor x \\in B\\}$ | $\\{1,2\\} \\cup \\{2,3\\} = \\{1,2,3\\}$ |
++-| Пересечение | $A \\cap B$ | $\\{x : x \\in A \\land x \\in B\\}$ | $\\{1,2\\} \\cap \\{2,3\\} = \\{2\\}$ |
++-| Разность | $A \\setminus B$ | $\\{x : x \\in A \\land x \\notin B\\}$ | $\\{1,2\\} \\setminus \\{2,3\\} = \\{1\\}$ |
+++| Объединение | A ∪ B | {x : x ∈ A ∨ x ∈ B} | {1,2} ∪ {2,3} = {1,2,3} |
+++| Пересечение | A ∩ B | {x : x ∈ A ∧ x ∈ B} | {1,2} ∩ {2,3} = {2} |
+++| Разность | A \\ B | {x : x ∈ A ∧ x ∉ B} | {1,2} \\ {2,3} = {1} |
++ 
++ ### Свойства
++-1. Коммутативность: $A \\cup B = B \\cup A$ [1].
++-2. Дистрибутивность: $A \\cap (B \\cup C) = (A \\cap B) \\cup (A \\cap C)$ [2].
++-3. Законы де Моргана: $\\overline{A \\cup B} = \\overline{A} \\cap \\overline{B}$ [2].
+++1. Коммутативность: A ∪ B = B ∪ A [1].
+++2. Дистрибутивность: A ∩ (B ∪ C) = (A ∩ B) ∪ (A ∩ C) [2].
+++3. Законы де Моргана (тяжёлая формула — отдельным блоком):
+++$$\\overline{A \\cup B} = \\overline{A} \\cap \\overline{B}$$ [2].
++ 
++ ### Итоги
++ Операции над множествами сводятся к трём базовым; их свойства повторяют законы логики. [1][2]"""
++@@ -244,7 +262,9 @@ class PromptBuilder:
++ Составь по материалам выше СТРУКТУРИРОВАННЫЙ КОНСПЕКТ строго по формату:
++ 1. ## Заголовок темы, затем ### подзаголовки по смыслу.
++ 2. Определения ключевых понятий — **жирным**, с ссылкой [N].
++-3. Формулы — LaTeX: $...$ инлайн, $$...$$ отдельной строкой.
+++3. Математика: инлайн — ЧИСТЫЙ UNICODE без $ и слэшей (∀x ∈ ℝ, A ⊆ B,
+++   x₀); тяжёлые формулы — изолированные блоки $$...$$ на отдельной строке;
+++   код — ```python ... ``` с указанием языка.
++ 4. Перечисления операций/свойств/классификаций — Markdown-таблицей (| ... | ... |).
++ 5. Теоремы и факты — списками (- или 1.) со ссылками [N].
++ 6. Ссылки на источники — ТОЛЬКО инлайн-метки [N] после утверждений.
++@@ -255,23 +275,23 @@ class PromptBuilder:
++ ЗАПРЕЩЕНО:
++ - копировать абзацы учебника дословно длинными фрагментами — пересказывай;
++ - выводить текст ВЕРХНИМ РЕГИСТРОМ или простыней без разметки (OCR-артефакты);
++-- писать формулы без знаков $;
+++- писать инлайн-формулы с LaTeX-командами, слэшами или $...$ (только чистый Unicode; LaTeX — исключительно внутри $$...$$ блоков);
++ - добавлять информацию, которой нет в контексте;
++ - начинать ответ с вводных фраз;
++ - писать в конце ответа раздел «Источники» или перечислять
++   источники списком (дублирование) — только инлайн-ссылки [N];
++ - упоминать эталонный пример из системного промпта и использовать его
++-  содержимое (множества A\u005ccup B и т.п.) если тема вопроса другая;
++-- писать $X \\setminus O(x_0)$ / $X \\setminus U(x_0)$ в определении предела
+++  содержимое (множества A ∪ B и т.п.) если тема вопроса другая;
+++- писать X \\\\setminus O(x₀) / X \\\\setminus U(x₀) в определении предела
++   по Коши — это переворот смысла; только проколотая окрестность:
++-  $x \\in \\dot{{O}}(x_0)$ или $x \\in O(x_0) \\setminus \\{{x_0\\}}$,
++-  квантор — $\\forall x \\in \\dot{{O}}(x_0) \\cap X$.
+++  инлайн x ∈ Ȯ(x₀) или x ∈ O(x₀) \\ {{x₀}}, квантор — ∀x ∈ Ȯ(x₀) ∩ X;
+++  в тяжёлых $$-блоках — x \\in \\dot{{O}}(x_0), \\forall x \\in \\dot{{O}}(x_0) \\cap X.
++ Обязательно включи хотя бы одну Markdown-таблицу (операции, свойства,
++ классификация или сравнение понятий из темы). ОБЪЁМ МИНИМАЛЬНЫЙ:
++ 1500 слов, целевой 1500-3000 —
++ раскрой КАЖДУЮ подтему и КАЖДЫЙ пункт контекста (конспект обязан покрыть весь
++ переданный материал, а не его начало); запрещены технические
++-маркеры {{FORMULA:N}} — формулы только как $...$;
+++маркеры {{FORMULA:N}} и парные скобки-ограничители backslash-paren / backslash-bracket; инлайн — чистый Unicode, LaTeX — только внутри $$...$$;
++ структура обязательна: название темой ##, подразделы через ### по числу тем
++ контекста, ключевые определения, теоремы со ссылками [N], таблица, ### Итоги."""
++ 
++@@ -342,7 +362,9 @@ class PromptBuilder:
++    определение — **жирным** с точной формулировкой и обозначениями;
++    каждая теорема/лемма — с условием, выводом и идеей доказательства;
++    каждый существенный факт автора — отдельным пунктом списка (- пункт [1]).
++-3. Формулы оформляй LaTeX'ом: $...$ инлайн, $$...$$ отдельно строкой.
+++3. Математика: инлайн — чистый Unicode без $ и слэшей (∀x ∈ ℝ, x₀);
+++   тяжёлые формулы — изолированные блоки $$...$$ на отдельной строке;
+++   код — ```python ... ``` с указанием языка.
++ 4. Если в главе есть классификации/свойства/операции — собери их
++    Markdown-таблицей; пункты без данных в таблице не оставляй пустыми.
++ 5. В конце — «### Итоги»: главные посылы автора и связь с предыдущими темами.
++diff --git a/src/processing/text_cleaner.py b/src/processing/text_cleaner.py
++index d73ea80..8e790e1 100644
++--- a/src/processing/text_cleaner.py
+++++ b/src/processing/text_cleaner.py
++@@ -165,6 +165,79 @@ def normalize_metadata(meta: Any) -> Dict[str, Any]:
++     return {}
++ 
++ 
+++# ---------------------------------------------------------------------------
+++# 4. Уровень 1+2 архитектуры (универсальная техлитература): сырой LaTeX-код
+++#    не должен попадать ни в UI, ни в векторный контекст. Инлайн-формы
+++#    \\( ... \\), \\[ ... \\] и одиночные $...$ переводятся в чистый Unicode;
+++#    тяжёлые display-блоки $$...$$ сохраняются как есть (для PNG-рендера).
+++#    Таблица команд — общее знание проекта: её использует и chat_view
+++#    (препроцессор Flet), поэтому импортируется оттуда напрямую при наличии.
+++# ---------------------------------------------------------------------------
+++_LATEX_TO_UNICODE = {
+++    r"\notin": "\u2209", r"\not\in": "\u2209", r"\in": "\u2208",
+++    r"\forall": "\u2200", r"\exists": "\u2203", r"\nexists": "\u2204",
+++    r"\dots": "\u2026", r"\ldots": "\u2026", r"\cdots": "\u2026",
+++    r"\emptyset": "\u2205", r"\varnothing": "\u2205",
+++    r"\subseteq": "\u2286", r"\supseteq": "\u2287",
+++    r"\subset": "\u2282", r"\supset": "\u2283",
+++    r"\cup": "\u222a", r"\cap": "\u2229", r"\setminus": "\u2216",
+++    r"\land": "\u2227", r"\lor": "\u2228", r"\neg": "\u00ac",
+++    r"\implies": "\u21d2", r"\iff": "\u21d4", r"\to": "\u2192",
+++    r"\rightarrow": "\u2192", r"\leq": "\u2264", r"\geq": "\u2265",
+++    r"\neq": "\u2260", r"\approx": "\u2248", r"\sum": "\u2211",
+++    r"\prod": "\u220f", r"\int": "\u222b", r"\infty": "\u221e",
+++    r"\partial": "\u2202", r"\nabla": "\u2207", r"\cdot": "\u00b7",
+++    r"\times": "\u00d7", r"\div": "\u00f7", r"\pm": "\u00b1",
+++    r"\mathbb{R}": "\u211d", r"\mathbb{N}": "\u2115", r"\mathbb{Z}": "\u2124",
+++    r"\mathbb{Q}": "\u211a", r"\mathbb{C}": "\u2102",
+++    r"\dot{O}": "O\u0307", r"\dot{U}": "U\u0307", r"\lim": "lim",
+++}
+++_SORTED_LATEX_KEYS = sorted(_LATEX_TO_UNICODE, key=len, reverse=True)
+++
+++_RE_TEX_DELIMS = re.compile(r"\\\[([^\[\]]*?)\\\]|\\\((.+?)\\\)", re.S)
+++_RE_INLINE_DOLLAR = re.compile(r"(?<!\\)\$(?!\$)([^$\n]+?)\$")
+++
+++
+++def _latex_body_to_unicode(latex: str) -> str:
+++    """Тело LaTeX-формулы → читаемый Unicode (для инлайновых форм)."""
+++    s = latex.strip()
+++    for cmd in _SORTED_LATEX_KEYS:
+++        if cmd in s:
+++            s = s.replace(cmd, " " + _LATEX_TO_UNICODE[cmd] + " ")
+++    # остаточные команды (\hat{x}, \vec a…): снимаем слэш — буквы останутся
+++    s = re.sub(r"\\[A-Za-z]+", lambda m: m.group(0)[1:], s)
+++    s = s.replace("\\", "")
+++    s = re.sub(r"[{}]", "", s)
+++    s = s.replace("_", "\u2009")
+++    return re.sub(r"\s{2,}", " ", s).strip()
+++
+++
+++def latex_inline_to_unicode(text: str) -> str:
+++    """Инлайн-математику \\(..\\), \\[..\\], $..$ переводит в чистый Unicode.
+++
+++    Display-блоки $$...$$ (тяжёлые формулы для PNG-рендера) не трогает.
+++    Идемпотентна: повторно вызванная на уже очищенном тексте ничего не меняет.
+++    """
+++    if not text or "\\" not in text and "$" not in text:
+++        return text
+++    # защита $$...$$ от разрезания одинарными $
+++    blocks: list = []
+++
+++    def _save(m):
+++        blocks.append(m.group(0))
+++        return "\x00BLK%d\x00" % (len(blocks) - 1)
+++
+++    text = re.sub(r"\$\$(.+?)\$\$", _save, text, flags=re.DOTALL)
+++    text = _RE_TEX_DELIMS.sub(
+++        lambda m: " " + _latex_body_to_unicode(m.group(1) or m.group(2) or "") + " ",
+++        text)
+++    text = _RE_INLINE_DOLLAR.sub(
+++        lambda m: " " + _latex_body_to_unicode(m.group(1)) + " ", text)
+++    text = text.replace("\\$", "$")
+++    text = re.sub(r"\x00BLK(\d+)\x00", lambda m: blocks[int(m.group(1))], text)
+++    return re.sub(r"[ \t]{2,}", " ", text)
+++
+++
++ def clean_text(text: str) -> str:
++     """Полный конвейер препроцессора (вызывается из TextCorrector)."""
++     if not text:
++@@ -172,4 +245,7 @@ def clean_text(text: str) -> str:
++     text = fix_punctured_neighborhood(text)
++     text = normalize_punctured_variants(text)
++     text = wrap_flat_math(text)
+++    # Level 1/2 ТЗ: после канонизации окрестностей убираем сырой инлайн-LaTeX,
+++    # чтобы в RAG-контекст и UI не попадали \(\mathbb, \forall, \dot и т.п.
+++    text = latex_inline_to_unicode(text)
++     return text
++-- 
++2.39.5
++
+diff --git a/_outbox/0007-Fix-SyntaxWarning-in-text_cleaner-docstring-smoke-te.patch b/_outbox/0007-Fix-SyntaxWarning-in-text_cleaner-docstring-smoke-te.patch
+new file mode 100644
+index 0000000..2b11c3d
+--- /dev/null
++++ b/_outbox/0007-Fix-SyntaxWarning-in-text_cleaner-docstring-smoke-te.patch
+@@ -0,0 +1,29 @@
++From cf717c2627a4be5368cfbc9c3540f78da069cace Mon Sep 17 00:00:00 2001
++From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
++Date: Tue, 27 Oct 2026 08:30:44 +0000
++Subject: [PATCH 7/8] Fix SyntaxWarning in text_cleaner docstring; smoke tests
++ for Levels 1-3 pass (punctured neighborhood, latex->unicode, display-block
++ protection, metadata normalization)
++
++---
++ src/processing/text_cleaner.py | 4 ++--
++ 1 file changed, 2 insertions(+), 2 deletions(-)
++
++diff --git a/src/processing/text_cleaner.py b/src/processing/text_cleaner.py
++index 8e790e1..34b38ae 100644
++--- a/src/processing/text_cleaner.py
+++++ b/src/processing/text_cleaner.py
++@@ -11,8 +11,8 @@
++ Правила замены (эталон ТЗ приведён как示意; здесь — синтаксически корректные
++ Python-regex с тем же смыслом):
++ 
++-    text = re.sub(r'X\s*\\\s*setminus\s+([UO]\(x_0\))', r'x \\\\in \\\\dot{\\1}', text)
++-    text = re.sub(r'X\s*\\\\\s*([UO]\(x_0\))',           r'x \\\\in \\\\dot{\\1}', text)
+++    text = re.sub(r"X\\s*\\\\+\\s*setminus\\s+([UO]\\(x_0\\))", r"x \\in \\dot{\\1}", text)
+++    text = re.sub(r"X\\s*\\\\+\\s*([UO]\\(x_0\\))",             r"x \\in \\dot{\\1}", text)
++ 
++ Модуль потокобезопасен: только чистые функции над строками, без общего
++ изменяемого состояния (скомпилированные regex неизменяемы).
++-- 
++2.39.5
++
+-- 
+2.39.5
+

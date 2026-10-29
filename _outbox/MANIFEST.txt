@@ -1,0 +1,48 @@
+# MANIFEST — финальный бандл изменений (песочница -> ваша машина)
+# База: da2fb65 (стабильная точка до пакета правок)
+
+## Единый tree-diff (рекомендуется, применяется поверх вашего HEAD):
+_outbox/FULL-tree-diff.patch        # 16 файлов src/** + config.example.yaml
+
+## Серия коммитов (git am, сохраняет историю):
+_outbox/0001-*.patch ... 0008-*.patch   # тематические коммиты
+_outbox/series/                          # полная серия от da2fb65
+
+## Изменённые файлы (16):
+config.example.yaml              student_name в конфиге
+src/core/settings.py             поле student_name, window_title(), сохранение
+src/ingestion/models.py          BlockType.FIGURE для PNG-зон
+src/ingestion/page_renderer.py   ленивый рендер зон формул в PNG 300dpi
+src/ingestion/pdf_parser.py      НОВЫЕ: _merge_paragraphs + _stitch_block
+                                 (склейка блоков, разорванных формулами;
+                                  защитные пробели ∀ ∃ ∈ ⊂ ℝ ...)
+src/llm/llm_engine.py            detect_model_window (реальное окно Ollama),
+                                 num_ctx <= window, _trim_history, _glue_parts,
+                                 json.loads секций /api/show (фикс 'str'.items)
+src/llm/prompt_builder.py        запрет X \setminus O(x_0), проколотая окрестность
+                                 \dot{O}(x_0); инлайн = Unicode, тяжёлые = $$..$$;
+                                 объём 1500-3000 слов; запрет раздела "Источники";
+                                 normalize_metadata для str-metadata
+src/llm/rag_pipeline.py          _to_dicts/normalize_metadata на всех путях,
+                                 нормализация messages перед llm.chat
+src/processing/exporter.py       PDF: токенизация text/formula, динамическая
+                                 высота строки, блочная изоляция высоких формул,
+                                 DPI из PNG, декларативные таблицы col_widths,
+                                 фолбэк reportlab при ошибке fpdf2
+src/processing/latex_renderer.py PNG 300dpi ч/б opaque, кэш под _MPL_LOCK
+src/processing/text_cleaner.py   normalize_metadata, latex->unicode таблица,
+                                 фикс OCR X\setminus O(x_0) -> \dot{O}
+src/processing/text_corrector.py интеграция cleaner в пайплайн
+src/ui/app.py                    page.title из settings.window_title()
+src/ui/chat_view.py              clean_inline_math, ft.DataTable, GITHUB_FLAVORED,
+                                 strip_duplicate_sources, приветствие по шаблону
+src/ui/layout.py                 вкладка "Настройки"
+src/ui/settings_view.py          поле Ф.И.О. студента + мгновенный page.title
+
+## Применение (Windows):
+cd C:\Users\Woodpecker_Prime\Projects\lama-loca-fixed
+git checkout math-rendering-and-content-issues-d686a
+git apply --check _outbox\FULL-tree-diff.patch   REM чисто? тогда:
+git apply _outbox\FULL-tree-diff.patch
+python -m py_compile src\ingestion\pdf_parser.py src\llm\llm_engine.py
+python main.py

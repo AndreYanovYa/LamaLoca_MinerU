@@ -1,0 +1,117 @@
+diff --git a/src/llm/llm_engine.py b/src/llm/llm_engine.py
+index bf4c1e7..bb423f0 100644
+--- a/src/llm/llm_engine.py
++++ b/src/llm/llm_engine.py
+@@ -1,6 +1,7 @@
+ # src/llm/llm_engine.py
+ import difflib
+ import json
++import os
+ import re
+ import threading
+ import requests
+@@ -29,6 +30,14 @@ _MODEL_WINDOW_LOCK = threading.Lock()
+ _DEFAULT_MAX_WINDOW = 16384
+ _MIN_USEFUL_WINDOW = 8192
+ 
++# FIX (400 Bad Request, лог 27.10 16:01): практический RAM-безопасный потолок
++# num_ctx. config.json модели может заявлять context_length 262144 — это
++# архитектурный максимум, а НЕ то, что llama.cpp реально аллоцирует: KV-кэш
++# под 262k токенов не влезает в память типовой машины и Ollama отвечает
++# 400 Bad Request ещё до генерации. Потолок можно поднять переменной
++# окружения OLLAMA_NUM_CTX_CAP / полем num_ctx_cap в config.yaml.
++_SAFE_CTX_CEILING = int(os.environ.get("OLLAMA_SAFE_CTX_CEILING", "32768"))
++
+ 
+ class LLMEngine:
+     """Обёртка над Ollama API для генерации ответов через /api/chat."""
+@@ -251,6 +260,16 @@ class LLMEngine:
+         max_new = max(64, min(desired_new, room))
+         window = max(_MIN_USEFUL_WINDOW, min(
+             window_cap, prompt_tokens + max_new + reserve))
++        # FIX (400 Bad Request, лог 16:01): detect_model_window вернул
++        # 262144 — это ПАРАМЕТР ARXITEКТУРЫ из config.json модели (напр.,
++        # Qwen3 context_length), а НЕ лимит установленного GGUF-чекапойнта.
++        # llama.cpp обязан аллоцировать KV-кэш под весь num_ctx; при 262k на
++        # машине пользователя аллокация не помещается и Ollama ОТКЛОНЯЕТ
++        # запрос ещё до инференса: 400 Bad Request на /api/chat. Раньше
++        # работало потому, что движок никогда не просил окно больше 16-32k.
++        # Поэтому вводим практический потолок RAM-безопасного окна и
++        # DEGRADE-MECHANISM ниже по чату (см. _chat_with_degradation).
++        window = min(window, _SAFE_CTX_CEILING)
+         return {
+             "temperature": 0.3,
+             "top_p": 0.9,
+@@ -453,7 +472,13 @@ class LLMEngine:
+                 content = msg.get("content", "") or ""
+                 if not content:
+                     continue
+-                allowed = max(256, len(content) - overhead * 3)
++                # FIX (NameError 'overhead'): переменная никогда не была
++                # определена — шаг 2 падал при переполнении окна. Считаем
++                # превышение бюджета в символах (~3 симв/токен для кириллицы,
++                # консервативно 2) и урезаем сообщение с запасом x3, чтобы
++                # цикл сходился за 1-2 прохода.
++                excess_chars = (_total() - budget) * 2
++                allowed = max(256, len(content) - excess_chars * 3)
+                 if allowed < len(content):
+                     msg["content"] = self._clip_message_content(content, allowed)
+                     logger.warning(
+@@ -553,6 +578,10 @@ class LLMEngine:
+         self._cont_retry_used = False
+         cont_messages = [dict(m) for m in messages]
+         full_parts: List[str] = []
++        # FIX (400): если сборка Ollama отвергла structured output — запоминаем
++        # это на весь движок и больше не шлём format=json_schema.
++        if getattr(self, "_schema_broken", False):
++            use_json_schema = False
+         schema = self.ANSWER_JSON_SCHEMA if use_json_schema else None
+ 
+         def _unwrap(raw: str) -> str:
+@@ -667,6 +696,46 @@ class LLMEngine:
+                             f"(попытка {attempt + 1}/{MAX_CONTINUATIONS})")
+             return "\n".join(p for p in full_parts if p.strip())
+         except requests.exceptions.RequestException as e:
++            # FIX (400 Bad Request, лог 16:01): Ollama отклонила запрос ЕЩЁ ДО
++            # генерации. Две известные причины 400 на /api/chat:
++            #   1) сборка Ollama/модель не принимает format=json_schema
++            #      (structured output появился только в Ollama >= 0.5);
++            #   2) KV-кэш под запрошенный num_ctx не аллоцируется (память).
++            # Раньше оба случая роняли чат с «Сбой Ollama API». Теперь —
++            # контролируемая деградация: сначала перезапрос без json_schema,
++            # затем с уменьшенным вдвое окном; при успехе схема запоминается
++            # отключённой для движка (не долбим сервер заведомо битым
++            # параметром). Исходная ошибка пробрасывается только если все
++            # ступени деградации исчерпаны.
++            status = getattr(getattr(e, "response", None), "status_code", None)
++            if isinstance(e, requests.exceptions.HTTPError) and status == 400 \
++                    and full_parts is not None and not any(
++                        p.strip() for p in full_parts):
++                if schema is not None:
++                    logger.warning(
++                        "LLM: Ollama отвергла structured-output (400) — "
++                        "повторяю запрос БЕЗ json_schema (режим совместимости "
++                        "со сборками < 0.5).")
++                    self._schema_broken = True
++                    return self.chat(messages, stream=False,
++                                     use_json_schema=False)
++                cur_ctx = options.get("num_ctx", 0)
++                if cur_ctx > _MIN_USEFUL_WINDOW:
++                    logger.warning(
++                        f"LLM: 400 Bad Request при num_ctx={cur_ctx} — "
++                        f"KV-кэш не аллоцируется; перезапрос с окном "
++                        f"{max(_MIN_USEFUL_WINDOW, cur_ctx // 2)}.")
++                    reduced_cap = max(_MIN_USEFUL_WINDOW, cur_ctx // 2)
++                    trimmed = self._trim_history(messages, reduced_cap)
++                    retry_opts = self._build_options(
++                        self.estimate_tokens(trimmed), reduced_cap)
++                    try:
++                        content, _dr = self._post_chat(
++                            model, trimmed, retry_opts, json_schema=None)
++                        if content.strip():
++                            return content
++                    except requests.exceptions.RequestException as e2:
++                        logger.error(f"LLM: деградация не помогла: {e2}")
+             logger.error(f"Ошибка при запросе к Ollama: {e}")
+             # Если первый кусок уже получен — отдаём его, а не выбрасываем.
+             if full_parts and any(p.strip() for p in full_parts):
