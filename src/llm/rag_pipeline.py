@@ -90,6 +90,44 @@ RRF_K = 60
 MAX_HISTORY_TURNS = 4
 
 
+# Ключ-канон для дедупликации: Unicode-глифы «плоской» версии блока ↔ ASCII-токены
+# (совпадают с именами LaTeX-команд после второго прохода _math_key).
+_MATH_CANON = {
+    "\u03b1": "a", "\u03b2": "b", "\u03b3": "g", "\u03b4": "d",
+    "\u03b5": "e", "\u03f5": "e", "\u03b6": "z", "\u03b7": "h",
+    "\u03b8": "th", "\u03bb": "l", "\u03bc": "m", "\u03bd": "n",
+    "\u03be": "x", "\u03c0": "p", "\u03c1": "r", "\u03c3": "s",
+    "\u03c4": "t", "\u03c6": "f", "\u03c8": "ps", "\u03c9": "w",
+    "\u0393": "G", "\u0394": "D", "\u0398": "TH", "\u039b": "L",
+    "\u03a0": "P", "\u03a3": "S", "\u03a6": "F", "\u03a8": "PS", "\u03a9": "W",
+    "\u2208": "in", "\u2209": "notin", "\u2203": "ex", "\u2200": "all",
+    "\u2204": "nex", "\u2205": "emp", "\u2282": "sub", "\u2286": "sube",
+    "\u2283": "sup", "\u2287": "supe", "\u222a": "cup", "\u2229": "cap",
+    "\u2216": "setmn", "\u2264": "le", "\u2265": "ge", "\u2260": "ne",
+    "\u2248": "ap", "\u2261": "equiv", "\u2192": "to", "\u21d2": "imp",
+    "\u21d4": "iff", "\u221e": "inf", "\u2211": "sum", "\u220f": "prod",
+    "\u222b": "int", "\u2202": "partial", "\u2207": "nabla", "\u00b7": "dot",
+    "\u00d7": "times", "\u00f7": "div", "\u00b1": "pm",
+}
+# подстрочные/надстрочные цифры и буквы индексов → обычные (x₀ == x_0)
+_SUBSUP_TRANS = str.maketrans({
+    "₀": "0", "₁": "1", "₂": "2", "₃": "3", "₄": "4", "₅": "5",
+    "₆": "6", "₇": "7", "₈": "8", "₉": "9", "ₙ": "n", "ₖ": "k",
+    "ₘ": "m", "ₓ": "x", "ᵢ": "i", "ⱼ": "j", "ₚ": "p", "ᵣ": "r",
+    "ₛ": "s", "ₜ": "t", "ᵤ": "u", "ᵥ": "v",
+})
+# имена LaTeX-команд → те же ASCII-токены, что даёт глиф-канал _MATH_CANON
+_MATH_NAME_MAP = {
+    "alpha": "a", "beta": "b", "gamma": "g", "delta": "d",
+    "varepsilon": "e", "epsilon": "e", "theta": "th", "lambda": "l",
+    "mu": "m", "nu": "n", "pi": "p", "sigma": "s", "phi": "f",
+    "omega": "w", "infty": "inf", "forall": "all", "exists": "ex",
+    "emptyset": "emp", "varnothing": "emp", "subseteq": "sub",
+    "subset": "sub", "leq": "le", "geq": "ge", "neq": "ne",
+    "approx": "ap", "rightarrow": "to", "cdot": "dot",
+}
+
+
 class RAGPipeline:
     """RAG-пайплайн с навигацией по структуре документа."""
 
@@ -1030,26 +1068,75 @@ class RAGPipeline:
     _SOURCES_HEAD_RE = re.compile(r"^\s{0,3}#{1,6}\s*[\U0001F4DA\s]*[Ии]сточники.*$",
                                   re.M)
 
+    @staticmethod
+    def _math_key(s: str) -> str:
+        """Ключ сравнения для дедупликации: LaTeX-маркеры ($, {, }, \\) вырезаются,
+        регистр/пунктуация игнорируются — «Лемма **X** $\\alpha$» и «Лемма X α»
+        дают один ключ. Используется _dedupe_sentences (баг 2 скриншотов:
+        модель печатает блок дважды — сначала с разметкой, потом плоско).
+
+        FIX (тесты): плоская версия блока содержит Unicode-глифы («α = inf X»),
+        а размеченная — LaTeX-команды («\\alpha = \\inf X»). Оба варианта
+        приводятся к одному канону: глиф ↔ имя команды (карты _MATH_CANON /
+        _MATH_NAME_MAP), индексы x₀/x_0 сворачиваются через _SUBSUP_TRANS."""
+        k = re.sub(r"[${}\\]", "", s)
+        # канал 1: глиф → ASCII-токен; канал 2: имена команд → тот же токен
+        for gl in sorted(_MATH_CANON, key=len, reverse=True):
+            k = k.replace(gl, " " + _MATH_CANON[gl] + " ")
+        k = k.translate(_SUBSUP_TRANS)
+        k = re.sub(r"\b(?:%s)\b" % "|".join(sorted(_MATH_NAME_MAP, key=len, reverse=True)),
+                   lambda m: _MATH_NAME_MAP[m.group(0)], k.lower())
+        return re.sub(r"[\W_]+", "", k.lower())
+
     def _dedupe_sentences(self, text: str) -> str:
-        """Удаляет подряд идущие дубликаты предложений (главный симптом
-        коллажа: модель печатает одно и то же предложение дважды)."""
+        """Удаляет подряд идущие дубликаты предложений и блоков (главный симптом
+        коллажа: модель печатает одно и то же дважды).
+
+        FIX (баг 2 жалобного анализа): раньше сравнивались ТОЛЬКО соседние
+        предложения через regex-разделители [.!?], а «Лемма …» / «Доказательство …»
+        оканчиваются формулой ($...$) или двоеточием — такие блоки никогда не
+        матчились и дубликаты доходили до пользователя. Теперь:
+        1) абзацы-дубликаты (ключ = текст без LaTeX-маркеров) — второй снимается;
+        2) предложения-дубликаты (прежний путь, но ключ тоже math-insensitive).
+        Идемпотентно; таблицы и $$-блоки не трогаются."""
+        # --- уровень 1: дубли абзацев (с учётом разницы в разметке) ---
+        paras = re.split(r"\n\s*\n", text)
+        seen: set = set()
+        out_p: List[str] = []
+        for p in paras:
+            key = self._math_key(p)
+            if len(key) >= 40 and key in seen:
+                continue  # нормализованный дубль убираем, оригинал уже сохранён выше
+            if len(key) >= 40:
+                seen.add(key)
+            out_p.append(p)
+        text = "\n\n".join(out_p)
+
+        # --- уровень 2: подряд идущие предложения-дубликаты ---
+        # FIX (тест T5): границы предложений определяем НЕ по [.!?] внутри
+        # текста, а по знаку в КОНЦЕ сегмента — иначе «P_n(x).» и формулы с
+        # точками/скобками разрывались на куски, дубликаты не матчились.
         changed = True
         while changed:
             changed = False
-            for m in re.finditer(r"(?P<s>[^.!?\n]{20,}[.!?])(?P<ws>[ \t]*|\n+)(?=\.!\?A-Za-zА-Яа-я«”\\$])",
-                                 text):
-                s = m.group("s").strip()
-                after = text[m.end():]
-                nxt = re.match(r"\s*(?P<t>[^.!?\n]{20,}[.!?])", after)
-                if not nxt:
+            parts = re.split(r"(\s+)", text)   # сохраняем разделители
+            for i in range(len(parts) - 2, -1, -2):
+                s, w, t = parts[i], parts[i + 1], parts[i + 2] if i + 2 < len(parts) else ""
+                if not t:
                     continue
-                t = nxt.group("t").strip()
-                key_s = re.sub(r"[\W_]+", "", s.lower())[:80]
-                key_t = re.sub(r"[\W_]+", "", t.lower())[:80]
-                if key_s and key_s == key_t:
-                    text = text[:m.start()] + text[m.end():]
+                a = s.strip(); b = t.strip()
+                if len(a) < 20 or len(b) < 20:
+                    continue
+                ka = self._math_key(a)[:80]; kb = self._math_key(b)[:80]
+                if ka and ka == kb:
+                    # убираем первое вхождение (и его хвостовой пробел)
+                    parts[i:i + 2] = ["", ""]
+                    text = "".join(parts)
                     changed = True
                     break
+            if changed:
+                continue
+            break
         return text
 
     def _anti_collage(self, answer: str) -> str:
