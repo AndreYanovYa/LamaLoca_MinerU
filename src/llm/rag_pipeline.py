@@ -309,7 +309,12 @@ class RAGPipeline:
                 if lang in ("", "md", "markdown"):
                     t = body[nl + 1:].strip()
         from src.llm.prompt_builder import PromptBuilder
-        return PromptBuilder.math_guard(t)
+        t = PromptBuilder.math_guard(t)
+        # FIX (лог ИИ-кодера 15:1x, Тейлор): косметика ответа LLM —
+        # \^ вне $$-блоков, broken bold («** п -ю производную**»),
+        # пустые маркеры списков. Идемпотентно, KaTeX-блоки не трогает.
+        from src.processing.text_cleaner import sanitize_llm_answer
+        return sanitize_llm_answer(t)
 
     @staticmethod
     def _fit_context(text: str, budget: int = 14000) -> str:
