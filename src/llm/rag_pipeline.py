@@ -527,13 +527,21 @@ class RAGPipeline:
         return [chunks[i] for i in order]
 
     def _estimate_full_prompt(self, question: str,
-                              chunks: List[Dict[str, Any]]) -> int:
-        """Оценка финального промпта (шаблон + история + все блоки). Метрика
+                              chunks: List[Dict[str, Any]],
+                              *, with_history: bool = False) -> int:
+        """Оценка финального промпта (шаблон + все блоки). Метрика
         идентична боевой отправке; исключения наружу не выпускаем — метод
-        вызывается в safe-guard'е перед самим собой же."""
+        вызывается в safe-guard'е перед самим собой же.
+
+        FIX (лог 20:43): история диалога по умолчанию НЕ учитывается — её
+        обрезкой до окна модели занимается llm_engine._trim_history; если бы
+        safeguard считал бюджет вместе с историей, он снимал бы релевантные
+        блоки учебника «про запас», хотя движок сам освобождает место под
+        них. with_history=True остаётся для ручных проверок."""
         try:
             msgs = self.prompt_builder.build_rag_prompt(
-                question, chunks, history=_to_dicts(self.history))
+                question, chunks,
+                history=_to_dicts(self.history) if with_history else None)
             fit = None
             try:
                 fit = self.llm.probe_fit(msgs)
@@ -615,22 +623,22 @@ class RAGPipeline:
             # «немого» length-обрыва. Адаптивный (12k старт / 20k после
             # подтверждения GPU) и не более окна модели минус генерация.
             budget = max(2048, min(window_cap - gen_reserve, prompt_budget))
-            # FIX (логи 00:56/10:48): раньше префлайт строил probe БЕЗ
-            # истории диалога, а реальный запрос — С историей; при втором+
-            # вопросе оценка занижалась на 1-3k токенов, фильтр пропускал
-            # перегруз и Ollama снова молчала (eval_count=None,
-            # done_reason='length'). Теперь метрика probe идентична
-            # финальному messages.
-            hist = _to_dicts(self.history)
-
+            # FIX (лог 20:43, откат идеи 00:56): probe строится БЕЗ истории
+            # диалога. История после первого вопроса занимает 2-6k токенов и
+            # съедала бюджет префлайта — фильтр выбрасывал релевантные блоки
+            # («§ 13. ВЫВОД ФОРМУЛЫ ТЕЙЛОРА…»), хотя llm_engine._trim_history
+            # сам обрезает историю до окна модели перед отправкой в Ollama.
+            # Бюджет префлайта теперь относится к «чистому» RAG-промпту;
+            # история — ответственность движка (окно num_ctx считается с
+            # запасом на генерацию, слоты не переполняются).
             def _probe_est(chunks):
-                """Оценка промпта «как в бою»: через probe_fit движка — тот
-                же chat-шаблон, история и скользящее окно, что реально
-                уйдут в Ollama (FIX логов 11:29: голова оценка по тексту
-                контекста занижала метрику на ~15%, и префлайт пропускал
-                перегруз -> пустые ответы при num_ctx 12-16k)."""
+                """Оценка промпта через probe_fit движка — тот же
+                chat-шаблон и скользящее окно, что реально уйдут в Ollama
+                (FIX логов 11:29: голая оценка по тексту контекста занижала
+                метрику на ~15%, и префлайт пропускал перегруз -> пустые
+                ответы при num_ctx 12-16k)."""
                 msgs = self.prompt_builder.build_rag_prompt(
-                    question, chunks, history=hist)
+                    question, chunks, history=None)
                 fit = None
                 try:
                     fit = self.llm.probe_fit(msgs)
