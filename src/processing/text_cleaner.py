@@ -428,6 +428,92 @@ def fix_llm_math_artifacts(text: str) -> str:
     return "".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# FIX (лог 21:10, Тейлор): «сырая» математика БЕЗ $...$ и без бэкслэшей в
+# прозе ответа. Модель пишет P n^(k)(x 0) = f^(k)(x 0) вместо P_n^{(k)}(x_0)=…;
+# ни math_guard, ни UI-нормализатор chat_view такую запись не видят (нет seed-
+# команды со слэшем), и пользователь видит голые символы. Здесь выражение
+# канонизируется в инлайн $...$: надстрочные ^{...}/^X → \index{}{},
+# подстрочные _ —> _, склеенные аргументы «x 0» → «x_0», функции cos/sin/lim…
+# → \cos…. Вызывается ДО fix_glued_quotes в chat_view, поэтому работает даже
+# если пользователь ещё не перенёс патчи UI. Идемпотентно: уже обёрнутые $...$
+# и $$...$$ блоки не трогаются.
+# ---------------------------------------------------------------------------
+
+_RAW_MATH_FUNC_RE = re.compile(
+    r"(?<![A-Za-z\\])(cos|sin|tg|ctg|arctg|arcctg|arcsin|arccos|ln|lg|log|"
+    r"exp|lim|max|min|det|dim|arg)(?=[\s_({]|\[)"
+)
+
+
+def normalize_bare_math_prose(text: str) -> str:
+    """«P n^(k)(x 0) = f^(k)(x 0)» → «$P_{n}^{(k)}(x_0) = f^{(k)}(x_0)$».
+
+    Эвристика ложных срабатываний: сегмент обязан содержать оператор (=, ≈,
+    ≤, ≥, +, -, ·, /) ИЛИ хотя бы две конструкции ^/_ — чистая кириллическая
+    проза под эти критерии не попадает. Пробелы между буквой/цифрой и цифрой
+    внутри формулы считаются индексом («x 0» → «x_0»).
+    """
+    if not text or ("^" not in text and "_" not in text):
+        return text
+    # защита display-блоков и уже корректных инлайн-формуль
+    blocks: List[str] = []
+
+    def _save(m: re.Match) -> str:
+        blocks.append(m.group(0))
+        return "\x00BLK%d\x00" % (len(blocks) - 1)
+
+    text = re.sub(r"\$\$.+?\$\$", _save, text, flags=re.DOTALL)
+    text = re.sub(r"(?<!\\)\$[^$\n]+?\$", _save, text)
+
+    # Сегмент «сырой» математики: термин (буква с опц. ^{...}/_{...},
+    # «A k», «f(x)») + одна или несколько связок оператором (= ≈ ≤ ≥ ≠ → + - · /).
+    _TERM = (r"(?:[A-Za-z](?:\^\{?[A-Za-z0-9()]{1,6}\}?|_\{?[A-Za-z0-9]\}?)?"
+             r"(?:\s(?=\d)[A-Za-z0-9]+)?(?:\((?:[^()]*)\))?)")
+    seg_re = re.compile(
+        r"(?<![A-Za-z\u0400-\u04FF0-9_])"
+        + _TERM
+        + r"(?:\s*(?:=|≈|≤|≥|≠|→|\+|-|·|/)\s*" + _TERM + r")+"
+        + r"(?![A-Za-z\u0400-\u04FF0-9_])"
+    )
+
+    def _canon(seg: str) -> str:
+        s = seg.strip().rstrip(".,;:")
+        # «x 0», «a k» — пробел перед цифрой = потерянный индекс
+        s = re.sub(r"(?<=[A-Za-z)])\s+(?=\d)", "_", s)
+        # «^ (k)» / «^(k)» / «^n» → «^{(k)}» / «^{n}»
+        s = re.sub(r"\^\s*\(([^()]{1,8})\)", r"^{\1}", s)
+        s = re.sub(r"\^\s*([A-Za-z0-9])", r"^{\1}", s)
+        # «_(...)» → «_{...}»; одиночный «_k» → «_{k}»
+        s = re.sub(r"_\s*\(([^()]{1,8})\)", r"_{\1}", s)
+        s = re.sub(r"_(?!\{)([A-Za-z0-9])", r"_{\1}", s)
+        # мат. функции курсивом быть не должны
+        s = _RAW_MATH_FUNC_RE.sub(r"\\\1", s)
+        return s
+
+    out_lines: List[str] = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("$$") or "```" in line:
+            out_lines.append(line)
+            continue
+
+        def _wrap(m: re.Match) -> str:
+            run = m.group(0)
+            has_op = bool(re.search(r"=|≈|≤|≥|≠|\+|-|·|/", run))
+            has_scripts = len(re.findall(r"[\^_]", run)) >= 2
+            if not (has_op or has_scripts):
+                return run
+            core = _canon(run)
+            if not core:
+                return run
+            return "$" + core + "$"
+
+        out_lines.append(seg_re.sub(_wrap, line))
+    text = "\n".join(out_lines)
+    return re.sub(r"\x00BLK(\d+)\x00", lambda m: blocks[int(m.group(1))], text)
+
+
 def fix_llm_bold_spacing(text: str) -> str:
     """Чинит broken bold: '** текст **' -> '**текст**' (CommonMark требует
     непробельный символ сразу после ** и перед ним). Только парные маркеры
