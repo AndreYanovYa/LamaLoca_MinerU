@@ -19,7 +19,8 @@ Python-regex с тем же смыслом):
 """
 import json
 import re
-from typing import Any, Dict
+from loguru import logger
+from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------------------
 # 1. Ложная разность множества на окрестностью (шум OCR проколотой точки).
@@ -516,129 +517,252 @@ _RAW_MATH_FUNC_RE = re.compile(
 )
 
 
-def normalize_bare_math_prose(text: str) -> str:
-    """«P n^(k)(x 0) = f^(k)(x 0)» → «$P_{n}^{(k)}(x_0) = f^{(k)}(x_0)$».
+# ---------------------------------------------------------------------------
+# InlineMathNormalizer (архитектурное решение, лог 23:xx): прежняя regex-версия
+# давала каскадные вложения ($O($x^{n}$+1)$) и молча пропускала «потерянные
+# индексы» без ^/_ («P n(x)», «x 0 = 0», «(x-x 0)»). Новый модуль режет текст
+# на КАНДИДАТЫ (сплошные ASCII-прогоны, не пересекающие слова прозы), каждый
+# нормализуется детерминированными правилами и проходит SYMPY-валидацию
+# (parse_latex + srepr — ловит битый LaTeX, которого regex не видит). Только
+# прошедшие валидацию кандидаты оборачиваются в $...$; остальные остаются
+# нетронутыми — никогда не выдаём сломанную формулу вместо текста.
+# Тот же модуль вызывается на ИНЖЕСТЕ (mineru_parser._add_prose) — формулы
+# канонизируются ДО векторизации, и LLM получает из ChromaDB чистый LaTeX.
+# ---------------------------------------------------------------------------
 
-    Эвристика ложных срабатываний: прогон обязан содержать оператор присваивания
-    (= ≈ ≤ ≥ ≠) ИЛИ хотя бы две конструкции ^/_ — чистая кириллическая проза
-    под эти критерии не попадает. «r n(x)», «A k» — буква + пробел + токен
-    считается одним именем (потерянный индекс), пробел перед словом прозы в
-    матчинг не пускается (lookahead). o/O-нотация («o(x^n)») распознаётся как
-    функция и не режется на переменную со скобкой вне $-блока (лог 21:10).
+
+class InlineMathNormalizer:
+    """Нормализация «голой» инлайн-математики в прозе.
+
+    API:
+        normalize(text) -> str        — полный проход (кандидаты + SymPy)
+        validate(expr) -> bool|None   — None, если sympy недоступен
+
+    Правила идемпотентны; кандидат обязан содержать скрипт (^/_), оператор
+    (= < > ≈ ≤ ≥ ≠) или o-нотацию — иначе это слово прозы и оно не трогается.
     """
-    if not text or ("^" not in text and "_" not in text):
-        return text
-    # защита display-блоков и уже корректных инлайн-формуль
-    blocks: List[str] = []
 
-    def _save(m: re.Match) -> str:
-        blocks.append(m.group(0))
-        return "\x00BLK%d\x00" % (len(blocks) - 1)
+    #: известные TeX/KaTeX-команды (символы и функции) — для структурной
+    #: проверки кандидатов до обращения к sympy
+    _KNOWN_CMDS = {
+        "alpha", "beta", "gamma", "delta", "epsilon", "varepsilon", "zeta",
+        "eta", "theta", "vartheta", "iota", "kappa", "lambda", "mu", "nu",
+        "xi", "pi", "rho", "sigma", "tau", "upsilon", "phi", "varphi",
+        "chi", "psi", "omega", "Gamma", "Delta", "Theta", "Lambda", "Xi",
+        "Pi", "Sigma", "Upsilon", "Phi", "Psi", "Omega",
+        "infty", "partial", "nabla", "forall", "exists", "in", "notin",
+        "subset", "subseteq", "supset", "cup", "cap", "emptyset",
+        "cdot", "times", "div", "pm", "mp", "leq", "le", "geq", "ge",
+        "neq", "ne", "approx", "equiv", "sim", "simeq", "to", "rightarrow",
+        "leftarrow", "Rightarrow", "mapsto", "ldots", "cdots", "dots",
+        "sum", "prod", "int", "lim", "frac", "sqrt", "text", "mathrm",
+        "mathit", "mathbf", "hat", "bar", "vec", "dot", "tilde", "circ",
+        "sin", "cos", "tan", "cot", "arcsin", "arccos", "arctan", "log",
+        "ln", "exp", "max", "min", "det", "dim", "ker", "deg", "gcd",
+        "sup", "inf", "limsup", "liminf", "o", "O",  # o-нотация Кудрявцева
+    }
 
-    text = re.sub(r"\$\$.+?\$\$", _save, text, flags=re.DOTALL)
-    text = re.sub(r"(?<!\\)\$[^$\n]+?\$", _save, text)
+    def __init__(self, use_sympy: bool = True):
+        self.use_sympy = use_sympy
+        self._sympy: Any = None
+        self._cache: Dict[str, Optional[bool]] = {}
 
-    _NAME = r"[A-Za-z](?:[ \t][A-Za-z](?![A-Za-z\u0430-\u04FF])|[A-Za-z0-9])*"
-    # скрипты: одиночные «^n», «_0» НЕ должны поглощать скобку функции —
-    # иначе «T_n(x)» матчалось как «T_n», и остаток «(x)…» разрывал прогон
-    # на куски с вложенными $-блоками (лог 23:xx). Скоба разрешена только
-    # в составе индекса «_{n}» или потерянного индекса «_n n».
-    _SCRIPTS = (r"(?:\^\{?[A-Za-z0-9()+\-]{1,10}\}?|_\{?[A-Za-z0-9]\}?(?!\()"
-                r"|_\{?[A-Za-z0-9][ \t][A-Za-z0-9]\}?)*")
-    # скобочная часть: до двух уровней вложенности; внутри допускаются
-    # потерянные индексы «x 0» (буква+пробел+цифра/буква), иначе greedy-прогон
-    # обрывался на «f^(k)(x» перед « 0)» и весь сегмент не оборачивался.
-    _ATOM_INNER = r"(?:[^()]|[A-Za-z][ \t]+[0-9A-Za-z]|\((?:[^()]|\([^()]*\))*\))*"
-    _PARENS = r"(?:\(" + _ATOM_INNER + r"\))?"
-    _TERM = "(?:" + _NAME + _SCRIPTS + _PARENS + ")"
+    # ---------------- SymPy-валидация ----------------
+    def _get_sympy(self):
+        if not self.use_sympy:
+            return None
+        if self._sympy is None:
+            try:
+                import sympy
+                from sympy.parsing.latex import parse_latex
+                parse_latex("x^{2}")  # smoke-test: antlr4-python3-runtime>=4.11
+                self._sympy = sympy
+            except ImportError:
+                # нет antlr-рантайма: parse_latex бракует ВСЁ — не валидируем
+                self._sympy = False
+            except Exception:
+                self._sympy = False
+        return self._sympy or None
 
-    def _canon(seg: str) -> str:
-        s = seg.strip().rstrip(".,;:")
-        # «o(...)», «O(...)» — малая/большая o-нотация: ФУНКЦИЯ, а не
-        # переменная; без префикса скобка вылетала за границу $-блока.
-        fn_pref = ""
-        m_fn = re.match(r"^([oO])(?=\()", s)
-        if m_fn:
-            fn_pref = chr(92) + m_fn.group(1) + " "
-            s = s[1:]
-        # unicode-подстрочные/надстрочные глифы текстового слоя PDF
-        # («x₀», «rₙ(x)», «x²ⁿ⁺¹») — в канонические ^{...}_{...}
+    def _structural_ok(self, s: str) -> bool:
+        """Баланс скобок + все \\<cmd> из белого списка KaTeX/MiKTeX-ядра."""
+        if s.count("(") != s.count(")") or s.count("{") != s.count("}"):
+            return False
+        for cmd in re.findall(r"\\([A-Za-z]+)", s):
+            if cmd not in self._KNOWN_CMDS:
+                return False
+        return True
+
+    @staticmethod
+    def _tex_to_sympy(expr: str) -> str:
+        """KaTeX-валидный текст → синтаксис, понятный sympy.parse_latex.
+
+        \\o/\\O (o-нотация), \\tg/\\ctg не входят в грамматику ANTLR-sympy —
+        заменяются на вызовы функций; операторные команды → знаки. Иначе
+        валидатор браковал бы корректные формулы (ложные False).
+        """
+        s = expr
+        # «\o (x)»/«\O (x)» → вызов функции o(x)/O(x) для грамматики sympy
+        s = re.sub(r"\\([oO])[ \t]+(?=\()", r"\1", s)
+        for cmd, rep in ((r"\\tg\b", r"\\tan"), (r"\\ctg\b", r"\\cot"),
+                        (r"\\arctg\b", r"\\arctan"), (r"\\arcctg\b", r"\\arccot"),
+                        (r"\\lg\b", r"\\log_{10}")):
+            s = re.sub(cmd, rep, s)
+        for cmd, op in ((r"\\approx", "="), (r"\\le\b", "<="), (r"\\ge\b", ">="),
+                        (r"\\neq\b", "!="), (r"\\cdot", "*")):
+            s = re.sub(cmd + r"[ \t]*", op + " ", s)
+        return s
+
+    def validate(self, expr: str) -> Optional[bool]:
+        """True — LaTeX структурно валиден; False — битый; None — нет sympy.
+
+        Первый уровень — структурная проверка (_structural_ok): баланс скобок
+        и белый список команд (ловит «\\foo», разорванные «($x$…» — то, что
+        regex-валидатор раньше не видел). Второй уровень — sympy.parse_latex
+        по частям равенства: части вида «f(x)» (функция от аргумента) легальны
+        в TeX, но запрещены грамматикой sympy — они заменяются на X перед
+        парсингом. Если antlr4-рантайм не установлен, sympy-уровень
+        пропускается (None), но структура всё равно проверяется.
+        """
+        if not self._structural_ok(expr):
+            return False
+        sp = self._get_sympy()
+        if sp is None:
+            return None
+        if expr in self._cache:
+            return self._cache[expr]
+        ok: Optional[bool] = None
+        try:
+            from sympy.parsing.latex import parse_latex
+            parts = [p.strip() for p in re.split(r"[=<>\u2248\u2264\u2265\u2260]", expr)]
+            checked_any = False
+            for p in parts:
+                if not p:
+                    continue
+                core = re.sub(r"\b[A-Za-z]\((?:[^()]|\([^()]*\))*\)", "X", p)
+                if not core.strip():
+                    continue
+                parse_latex(self._tex_to_sympy(core))
+                checked_any = True
+            ok = True if checked_any else None
+        except Exception:
+            ok = False
+        self._cache[expr] = ok
+        return ok
+
+    # ---------------- нормализация кандидата ----------------
+    def _normalize_candidate(self, cand: str) -> Optional[str]:
+        s = cand.strip().strip(".,;:")
+        if not s:
+            return None
+        has_script = bool(re.search(r"[\^_]", s))
+        has_op = bool(re.search(r"[=<>\u2248\u2264\u2265\u2260]", s))
+        has_o = bool(re.search(r"(^|[\s(/+\-])[oO]\s*\(", s))
+        if not (has_script or has_op or has_o):
+            return None
+        # потерянные индексы: буква/цифра/скобка + пробел + токен → «x_0», «r_n»
+        s = re.sub(r"(?<=[A-Za-z0-9)\]])[ \t]+(?=[A-Za-z0-9])", "_", s)
+        # «o (…)», «O (…)» — o-нотация: TeX-команда с пробелом («\o »),
+        # KaTeX-совместимо; голые «o(x)»/«O(x^n+1)» без пробела тоже легальны,
+        # но нормализуем к единому виду только при явном пробеле.
+        s = re.sub(r"(^|(?<=[\s(/+=]))([oO])[ \t]+(?=\()", r"\1\\\2 ", s)
+        # unicode-скрипты текстового слоя PDF (x₀, rₙ, x²ⁿ⁺¹)
         s = "".join(_SUB_DIGITS.get(ch, ch) for ch in s)
         s = re.sub("(?<=[A-Za-z0-9)])([" + _SUP_KEYS + "]+)",
                    lambda mm: "^{" + "".join(_SUP_MAP[c] for c in mm.group(1)) + "}",
                    s)
-        # «x 0» — пробел перед цифрой после имени = потерянный индекс
-        s = re.sub(r"(?<=[A-Za-z])[ \t]+(?=\d)", "_", s)
-        # «r n(x)», «P n^(k)» — буква+пробел+буква: потерянный индекс
-        # имени функции (перед «(», «^», «_» или на конце сегмента).
-        s = re.sub(r"(?<=[A-Za-z])[ \t]+(?=[A-Za-z](?:\(|\^|_|\b))", "_", s)
-        # «^ (k)» / «^(k)» / «^n» → «^{(k)}» / «^{n}»
-        s = re.sub(r"\^\s*\(([^()]{1,8})\)", r"^{\1}", s)
+        # скрипты в канон: ^(k)→^{(k)}, ^{n}→^{n}, ^n→^{n}, _k→_{k}
+        s = re.sub(r"\^\s*\(([^()]{1,10})\)", r"^{\1}", s)
+        s = re.sub(r"\^\s*\{([^{}]{1,12})\}", r"^{\1}", s)
         s = re.sub(r"\^\s*([A-Za-z0-9])", r"^{\1}", s)
-        # «_(...)» → «_{...}»; одиночный «_k» → «_{k}»
-        s = re.sub(r"_\s*\(([^()]{1,8})\)", r"_{\1}", s)
+        s = re.sub(r"_\s*\(([^()]{1,10})\)", r"_{(\1)}", s)
         s = re.sub(r"_(?!\{)([A-Za-z0-9])", r"_{\1}", s)
-        # мат. функции курсивом быть не должны
+        # функции/операторы → TeX
         s = _RAW_MATH_FUNC_RE.sub(chr(92) + r"\1", s)
-        return fn_pref + s
+        s = s.replace("\u00b7", "\\cdot ")
+        for bad, good in (("\u2248", "\\approx "), ("\u2264", "\\le "),
+                          ("\u2265", "\\ge "), ("\u2260", "\\neq ")):
+            s = s.replace(bad, good)
+        s = re.sub(r"\s+", " ", s).strip()
+        if not s:
+            return None
+        if s.count("(") != s.count(")") or s.count("{") != s.count("}"):
+            return None
+        # одинокая переменная без оператора/скрипта — шум (например «Pn»)
+        if len(s) < 3:
+            return None
+        return s
 
-    # Связки: сначала «сильные» (= ≈ ≤ ≥ ≠), затем слабые (+ − · /) только
-    # между атомами со скриптами/скобками — чтобы «коэффициент + свободный
-    # член» из прозы не склеивался в формулу.
-    _LINK = (r"(?:\s*(?:=|\u2248|\u2264|\u2265|\u2260)\s*|[ \t]*(?:[+\u00b7/]|-(?!\s))[ \t]*)")
-    seg_re = re.compile(
-        r"(?<![A-Za-z\u0400-\u04FF0-9_$])"
-        + _TERM
-        + r"(?:" + _LINK + _TERM + r")+"
-        + r"(?![A-Za-z\u0400-\u04FF0-9_])"
+    # ---------------- основной проход ----------------
+    # Кандидат = сплошной ASCII-прогон, начинающийся с буквы/цифры/«$» и т.д.,
+    # НЕ пересекающий слова прозы (границы — кириллица/пробел-слово). Стартовая
+    # группа допускает открывающую скобку, чтобы «(x+a)^1 = x + a» захватывался
+    # целиком (прежний вариант стартовал с буквы и резал прогон на «x+a)^1…» —
+    # разбаланс отбрасывал кандидат, формула оставалась сырой).
+    _CAND_RE = re.compile(
+        r"(?<![А-Яа-яЁёA-Za-z0-9_$\\])"
+        r"(?:[A-Za-z0-9]|[(\[])((?:[A-Za-z0-9 \t^_(){}\[\]/+\u00b7*=<>~"
+        r"\u2248\u2264\u2265\u2260,\-.])*[A-Za-z0-9)\]])?"
+        r"(?![А-Яа-яЁёA-Za-z0-9_])"
     )
-    # Одиночные атомы без связки (лог 23:xx: «T_n(x)», «f^{k}» в прозе раньше
-    # оставались сырыми — seg_re требует оператор между TERM). Обёртываются
-    # ТОЛЬКО атомы с явным скриптом ^/_ (уже каноничная математика); атомы вида
-    # «P n(x)» без ^/_ не трогаем — эвристика не отличает их от прозы.
-    single_re = re.compile(
-        r"(?<![A-Za-z\u0400-\u04FF0-9_$])"
-        + _NAME
-        + r"(?:(?:\^\{?[A-Za-z0-9()+\-]{1,10}\}?|_\{?[A-Za-z0-9]\}?)" + _PARENS + _SCRIPTS + _PARENS
-        + r"|" + _SCRIPTS + r"(?:\^\{?[A-Za-z0-9()+\-]{1,10}\}?|_\{?[A-Za-z0-9]\}?)" + _PARENS + ")"
-        + r"(?![A-Za-z\u0400-\u04FF0-9_])"
-    )
 
-    def _wrap(m: re.Match) -> str:
-        run = m.group(0)
-        has_eq = bool(re.search(r"=|\u2248|\u2264|\u2265|\u2260", run))
-        has_scripts = bool(re.search(r"[\^_]", run))
-        if not (has_eq or has_scripts):
-            return run
-        core = _canon(run)
-        if not core:
-            return run
-        # разбаланс скобок = сегмент дописан неполно («f^{k}(x$ 0)») — не трогаем
-        if core.count("(") != core.count(")"):
-            return run
-        return "$" + core + "$"
+    def normalize(self, text: str) -> str:
+        if not text:
+            return text
+        blocks: List[str] = []
 
-    def _wrap_single(m: re.Match) -> str:
-        run = m.group(0)
-        if not re.search(r"[\^_]", run):
-            return run
-        core = _canon(run)
-        if not core or core.count("(") != core.count(")"):
-            return run
-        return "$" + core + "$"
+        def _save(m: re.Match) -> str:
+            blocks.append(m.group(0))
+            return "\x00B%d\x00" % (len(blocks) - 1)
 
-    out_lines: List[str] = []
-    for line in text.split("\n"):
-        stripped = line.strip()
-        if stripped.startswith("$$") or "```" in line:
-            out_lines.append(line)
-            continue
+        text = re.sub(r"\$\$.+?\$\$", _save, text, flags=re.DOTALL)
+        text = re.sub(r"(?<!\\)\$[^$\n]+?\$", _save, text)
+        text = re.sub(r"`[^`\n]+?`", _save, text)
 
-        line = seg_re.sub(_wrap, line)
-        line = single_re.sub(_wrap_single, line)
-        out_lines.append(line)
-    text = "\n".join(out_lines)
-    return re.sub(r"\x00BLK(\d+)\x00", lambda m: blocks[int(m.group(1))], text)
+        def _repl(m: re.Match) -> str:
+            raw = m.group(0)
+            cand = self._normalize_candidate(raw)
+            if cand is None:
+                return raw
+            if self.validate(cand) is False:
+                return raw
+            # после канона обязан остаться математический маркер
+            if not re.search(r"[\^_=\\]", cand):
+                return raw
+            return "$" + cand + "$"
+
+        out_lines: List[str] = []
+        for line in text.split("\n"):
+            if line.strip().startswith("$$") or "```" in line:
+                out_lines.append(line)
+                continue
+            out_lines.append(self._CAND_RE.sub(_repl, line))
+        text = "\n".join(out_lines)
+        return re.sub(r"\x00B(\d+)\x00", lambda m: blocks[int(m.group(1))], text)
+
+
+_DEFAULT_NORMALIZER: Optional[InlineMathNormalizer] = None
+
+
+def get_inline_math_normalizer(use_sympy: bool = True) -> InlineMathNormalizer:
+    global _DEFAULT_NORMALIZER
+    if _DEFAULT_NORMALIZER is None:
+        _DEFAULT_NORMALIZER = InlineMathNormalizer(use_sympy=use_sympy)
+    return _DEFAULT_NORMALIZER
+
+
+def normalize_bare_math_prose(text: str) -> str:
+    """Совместимость: прежняя точка входа делегирует InlineMathNormalizer.
+
+    Вызывается из sanitize_llm_answer (уровень ответа LLM) и из
+    mineru_parser._add_prose (уровень импорта книги — ДО чанкинга и
+    векторизации). Идемпотентен; никогда не выдаёт сломанную формулу.
+    """
+    try:
+        return get_inline_math_normalizer().normalize(text)
+    except Exception as ex:  # косметика не валит импорт/ответ
+        logger.warning(f"normalize_bare_math_prose: пропуск ({ex})")
+        return text
 
 
 
@@ -691,6 +815,12 @@ def sanitize_llm_answer(text: str) -> str:
         return text
     try:
         text = fix_llm_math_artifacts(text)
+        # FIX (InlineMathNormalizer): раньше нормализация «голой» математики
+        # была написана, но НИКОГДА не вызывалась из sanitize_llm_answer —
+        # поэтому импорт с корректными формулами всё равно давал сырой текст
+        # в ответе, когда модель копировала плоский текст чанка. Теперь уровень
+        # «ответ LLM» закрыт; идемпотентность проверяется тестом.
+        text = normalize_bare_math_prose(text)
         text = fix_llm_bold_spacing(text)
         text = drop_empty_list_items(text)
     except Exception as ex:  # косметика никогда не должна ронять ответ

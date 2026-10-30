@@ -855,9 +855,22 @@ class MinerUParser(BaseParser):
     def _add_prose(self, add, prose: str) -> None:
         """Проза: маркированные списки режем по пунктам, остальное — TEXT.
 
+        FIX (InlineMathNormalizer, уровень импорта): текстовый слой MinerU
+        отдаёт инлайн-формулы плоским текстом («P n^(k)(x 0) = f^(k)(x 0)»,
+        «r n(x) = o(x^n)») — pix2tex их не видит (это не изображения), и в
+        ChromaDB ложится битая математика, которую LLM затем копирует в ответ.
+        Канонизируем такие фрагменты в LaTeX ДО чанкинга/векторизации;
+        оригинальный текст остаётся в PDF, нормализация идемпотентна и
+        молча пропускает всё, что не является достоверной формулой.
+
         Таблицы (строки с |...|) сохраняем как TABLE целиком — чанкер и RAG
         получают их единым куском.
         """
+        try:
+            from src.processing.text_cleaner import normalize_bare_math_prose
+            prose = normalize_bare_math_prose(prose)
+        except Exception as ne:  # noqa: BLE001 — косметика не валит импорт
+            logger.debug(f"MinerU: InlineMathNormalizer пропущен ({ne})")
         lines = [l.rstrip() for l in prose.splitlines() if l.strip()]
         if not lines:
             return
