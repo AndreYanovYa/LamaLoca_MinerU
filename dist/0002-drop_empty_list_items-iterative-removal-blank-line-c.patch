@@ -1,0 +1,93 @@
+From dc82e0070d22eb525126507bee6cf0bad63b5465 Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Fri, 30 Oct 2026 12:53:44 +0000
+Subject: [PATCH 2/3] drop_empty_list_items: iterative removal + blank-line
+ collapse -> full pipeline idempotent
+
+---
+ .../__pycache__/text_cleaner.cpython-312.pyc  | Bin 35573 -> 35722 bytes
+ src/processing/text_cleaner.py                |   9 +++++++--
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/src/processing/__pycache__/text_cleaner.cpython-312.pyc b/src/processing/__pycache__/text_cleaner.cpython-312.pyc
+index 6bc23dcff253c7c5e29b7a0243d55439f30f738b..13eacae496629f459a6d194a8f762d3ff2d6b004 100644
+GIT binary patch
+delta 1918
+zcmZuxZ%k8H6z_R`G!(EcD*pyTg(7{WB2++Oi-7oVlY$gbfwIz36hR8!wxF)ePBtgt
+zhIsr-GNa;*ju10n%sx1?Y|B3B2N%DXm;K2Wm&KTDB)TPAvTXOfB9hJb;djqH=XcIM
+z@7#0l@27;(GlJpHqD65U{?+5d?z`tcF(jKn!dz1UB*~4YCV+JL<HSQTkb$<80?3w|
+zQw9?t6TitRaO83?wt|BqbaW{(zRvz&mjd02=neMuvQ=b&9!1YOy*`hs%E2N_DwNBw
+zS$-9uL@vwQ0r`cTCdIPnv0xWlL#|pc+pWax3i&$%teh)Y4&JifHqm)ZBG41q@CR2K
+zUX(U2N#R=w*j8G!icnC<YVc2Kh$lY2Hxp0UI+rc*;-pR2IFDs;NdX@#!Ib>#EtHHJ
+zfuHU_plAa@CK*@`Y3qon^@n;D=vVZ<PQND*^s*o;C1V+Znzi6{C_=Y`?I4Ydpq8K<
+z&Gxn6m7DFOV!oF&2?W^$Y6V0V!(}D5ufLOd{k{NmlgT9;ik8CSR+5);kOY=Uau*gm
+zEYK}CJ8pscgGpGiO^>UKPv|nqZpAyrMUaJm7pFpooLq7bz>2?=F0=09*1xnv77G)&
+zbPd!rr0C&uN0R?O*}kR;atBCO%S?VOmSB)zKL<%rgx+4Z53j5ph*vYDHe!1)ugsCs
+zO$3qkkmdjfMcWq&a&CW_6(aJvvd1Fy@Ow$ZwhFyGwJr}*vp9?ALsbX>2QxEpWMQ1C
+zT8HM!%gOK3_Q(s(sa1!PDWw;hPe24K*QfFGTGoFSYvnXa&ss6Fx)R<;Pjwwk%GaxB
+z#DWoSIVid<ZcFq>-{JdOM*M?%YsD+e-EN7Ss2WlXE5y+)L71BQXNw5=C!A@EsoPbu
+zq+@Cw#xdWSk#>^kqIzjcOh50JK(y0)u-$2cX?e_fUVzhTB`UUEgc<yC+lVytEEc1G
+z=69~PhWJLG??8aA%{*6|F2wo|Q}z&hVTYV1MHg;%oq-Sdbkx{rGFTG_-tYB%QD85-
+z!PkJ6gV`L3R=R<2(Cac|sG&4PjYr9|aSqSg?goC@umW!4qlUf75w1U@@xc&;A*|`)
+z&CjyJ8vLSfdAi`!hBea^oPR@_c{?1-!ioMYd@0GO3u_uQl1?6P`~wcvhN?KxTG1=L
+z-fDIS+ia~rMJ~Blx@~RNigHzxAD%O~Lyp3tVii}nMRgJ<x&2{_6um2*+yCZj`_Mrl
+zE{><IUd4jRQN(`MIk2#bN)kTWo>lMU8ALR*ahe2EWW$3v!*R=~{ef}GQSn=2;`qSG
+zz`f*_2g#{tEl;#yG9MLZV>I!`<CZb|Q|@6HFC8g8E}h+eq49pajl0JiBU^D|L%O_a
+zM~7gr@zAxrEvEU(ZsMoSO>kdc)Y7ff*-5h!huR$`wcs=Z>hr_Q_<8#(KH0yu7r{e$
+zx%Z+LHp^f61_kJlU*6rOgFSezHw3HD=r{8@FZ8Fvd3@EM@!xI`*;9&{fnonz*eT!i
+z-x75nk!A#;U@49Uj>b>WR(*{Maaqs_W7rei3|H{GP#WG1zL!lCa7|zuK9o_~|7Wm$
+zpa3TDa%ej7#kP|;K5!{x=lnrh9xHkWbG;Wv3UM04gOzX<Zx812zxjEv0>X0c{>%EL
+zN%Bl0NLOP}DpUCV+jf}5_`?&@^ARx4GgIg3S4kQr7{jj*XS<G(IK)AT^Ej&-w|J@=
+z>zwQ@(yH&Vm!xij2!VR|6ql4lk87i+rpC!1jSU;u*VI*SeRij1!)7SNmf@24W^yr7
+ff=%+|aGS6s0ZbRPvl_l!)jpwRHdBr}@>u*A!%yLr
+
+delta 1818
+zcmZuyeN0nV6z_TOwWEL)5L(!%KBWq;#Y!t8s1Z?_M5!RHA7EKmEq)*ra@ztDnJCUp
+zbW=GYxR}i^;>P@nyNQ3y?VtT?V%%R_p2^&nCCg&6ndp{m$+F$^iXYkRAHRD(e&^hC
+z&pr2bbVB-lT(aGnF(cC?ejfa(^P4j_ZT1|P!udH~u=7yPW`JV;Y3@NYIMMC!LJ4nm
+z^k>5y{JO;JUm&7bsQ_Ktxkoq0I(n0Pbm-KTXtJl9RgeSr=~mVejYSNT3w^FaSkBkG
+zewCn#*OYDrk5ACF4E8)1>|)gvDo5FF-MlLm-<e>`g@L*7cG;IXv>$U5SP4A%prr^e
+zX!WxSg{lE-q(#;xZv_kBpW2Wp{9*HK9Cvp(Ux*T<*QW%JIfbM{j8&n-bEA!lF*1nV
+z<NI|vkz|^Uxyaf~L^+=7)}dFo#yaAWL^8^fY$-XH5g1iVQNJ#A`q?(J1PPi5mZMr;
+z4Lf*i`KaRAL6&TS5(1+G3Ns5?&*<sxV9|Ii!P?0c<ThVE<b_Gj7obTjm*l-z>36|C
+z-s-;%7CHj6Ab9g}PST8vE5|Hz$fV(&N*}2BcV!_sxqZn!01bbxa+d8D-oNA_my1b4
+zngXL1EnUI%z7)@R`O?iWzn^5I*A&Mx2nGoD3(zE8>h5L?FIV?v8D-Keu}&<l@jLbr
+zL1A5F85E$)J*lMN_STfaA^t(lL&a+NEW(G)wRV1KWhoS@LK8JnI}#v3Wj29q2(Q(x
+zM0M4q{V1vLywqJ-chF8{z0^Ghhj7*EBIv@l)n8<2f~Hwn7-z3p1@B{IO%t5uH`ZKJ
+zyraT1sDxc%SNgDT3w<La{-Cw2cE#LqSQ9Slh-PL!9BoL#<fVTa6eu4H6y?#_8)VJG
+zj9#2VPoTJHoal;id%C$-3{E0F@?H35zztXV@xVutWrAX#-(*Ac8Mux=G#}HhKTXQ$
+z@L~##VNrJU#P%oX4%O)<?M2-5p`(-7FV2jScQ3AMnShhxy)?S%t*|YWN@gu$(V>fR
+zu_j~zsydu*c}OT2ZBa25ta2Fn=oIXffTx4V@vGnhxP`w2yD}<;eZrIktnfMuASN9!
+zU7>X1H)J|s3W~k>{m>r}POT88vf6I#jqPeU+3w!{<M74s!mztNt$NC8mu(NH{1v`R
+z0~b%*wOZi_#}Bx)bbF<Ad+AxQ0s+RbV8hnZ5}N*D)00e7w(Vrqv8sD{o4(D<KNWi{
+zLw51-+V8Vw4sXEIYhUB{x9*f|9zotH?&>P#xrL2wo8d0M*w$&WEF_B;^P>J7<M1l!
+zjRbQs6kQ}fEJva~c))K(FUZiqw{`SO5aaiDw_6~F-gpWsa5ApGN@03lB-qpvs$Uyv
+ztP9m|i)^TG4YG6iUA*|em!+^Lw1X3Kd#WMG*Z163ESJeLI{m=k%^D*$o4|*kB?EAD
+zEVT|k#@ya~45v=aqd}dLm`S{yH0%FQC9}^9C$OgPO76>jC(+e^vAFfwKC;M_p0nx6
+z7{biH#aJ+~Li|;<43xq-92}^He*XEuq_yBI#n}mpjSN)CBqk1*!#JKld|G=xo->~@
+zi=NS^NIFh%0^3IBEqRZ`w*=^!kw9IjAyOA=3b2D@HNKw4$CSP_>=1#m`6S*Paag8r
+u^zMiXKKyNDNmd&XW>Ps@_@X22(yUh?=e+#LB$iL)$Fw}k=jV<-RQ?4WD7<C>
+
+diff --git a/src/processing/text_cleaner.py b/src/processing/text_cleaner.py
+index ebecee2..bd1f7b0 100644
+--- a/src/processing/text_cleaner.py
++++ b/src/processing/text_cleaner.py
+@@ -454,8 +454,13 @@ def drop_empty_list_items(text: str) -> str:
+       1. маркер без текста вовсе: '• ', '- ', '* ' (только пробелы после);
+       2. висячее тире после маркера: '-  — ' / '- –' (потеряна переменная).
+     Строки вида «— текст» (нормальный пояснительный абзац) НЕ трогает."""
+-    text = re.sub(r"(?m)^[ \t]*[•\-\*][ \t]*+(?:[\u2014\u2013][ \t]*)?(?:\n|$)",
+-                  "", text)
++    prev = None
++    while prev != text:
++        prev = text
++        text = re.sub(r"(?m)^[ \t]*[•\-\*](?:[ \t]+|[ \t]*[\u2014\u2013][ \t]*)(?:\n|$)",
++                      "", text)
++    # схлопнуть серию пустых строк, оставшихся после вырезания, до одной
++    text = re.sub(r"\n{3,}", "\n\n", text)
+     return text
+ 
+ 
+-- 
+2.39.5
+

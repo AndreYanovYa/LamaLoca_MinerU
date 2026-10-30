@@ -1,0 +1,432 @@
+From 6187ed3f113017490f5692389e87fd84802e1657 Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Fri, 30 Oct 2026 12:53:17 +0000
+Subject: [PATCH 1/3] Fix LLM answer markup artifacts (Taylor log):
+ sanitize_llm_answer postprocessor (\\^ outside $$ blocks, broken bold '** x
+ **', empty list markers) wired into _strip_code_fences; system prompt rule
+ 9b; raw docstring (SyntaxWarning)
+
+---
+ .../prompt_builder.cpython-312.pyc            | Bin 40547 -> 41526 bytes
+ .../__pycache__/rag_pipeline.cpython-312.pyc  | Bin 89992 -> 90075 bytes
+ src/llm/prompt_builder.py                     |  11 ++-
+ src/llm/rag_pipeline.py                       |   7 +-
+ .../__pycache__/text_cleaner.cpython-312.pyc  | Bin 30996 -> 35573 bytes
+ src/processing/text_cleaner.py                |  83 ++++++++++++++++++
+ 6 files changed, 99 insertions(+), 2 deletions(-)
+
+diff --git a/src/llm/__pycache__/prompt_builder.cpython-312.pyc b/src/llm/__pycache__/prompt_builder.cpython-312.pyc
+index f4feac6e0cdbf4c7200c236a22c5e051271cefc8..35f303c4719d3faacd2b52f51b38a63cbd71193b 100644
+GIT binary patch
+delta 1213
+zcmZ{k-)mD@5XU`PZAFcOqBUA&d|7WUNh*kfExP#Y$*u(vEO=>+Rt3A;q7)32nl!Dt
+zQf;-@ie&v!Wm#5=nD!)Xnlz~tpY&x8vTwUC)I}6TihqIMxvf7?%)`x@bLPx^=QDHf
+z%L(7;6W`Kje*dC*_^ojNKlS(E@X{p<eaqMB%7sP$3df2>B90Rz&XMCB7DK;Yxyt8v
+zEZD)2Y?9-qwnyA8tKZwsi8Ik-?I#-At>$2d6>HoS>}YS^&>?QWM1MWn6t!YO3R4VM
+z_6M5W;Xug!C-6XbuZgJmwxbc^t31f}d4T`GDuvY$@k1;IVczDO_`k#bbL&UMH|gh{
+z2lnl$JG7rH9yQlYr%7_2OPnR1Gzm`g2<N!Kr4Y%JH6dh{$HkE2VD%y*;(Po%5B$h~
+zAs$b17AING5d3G2G=h5WJi$44M+N;vNRs9}ago#JB9@3pwb6se>%(6932YTPV|paK
+z<v}5*t(BZ(O|5Ogh`YLy;^Z`VP#Xy%i%|US{aJOBoHM@xf2(E1gdLzZw17OP2}}mQ
+z+;?zLL(#^T&!<tRu_fYFc>{40Tr@pAPPQFKdBdiU$525M^%l%!s3?)?L@_yR!LaRW
+z*aC{jOqZ}JdB>nzf=AvY5Nreidd(%=IghYX(r1QVUS#;%6(Hj|@t#gx7l>J}TM+b7
+zh$j-ca_}61(n2*&4cT@}*!0eJwuGZG?<j+kx=gQaPZdI5zBw%74`2GumH6Bp%v=fr
+zN2OZ;10h`yls8EsA?Q1$*D?%qw74iICC+$*GAj7YWl8K|%*zN0fls6`3m};Hywf!#
+zz@^$aHZGxDVJ^<NEz?>seG<>pA)64Dl^!G!ql74+D<hrZw4|IG3ezk@486Hxx=l9}
+zUw{Jwn<U=WsRBA89fj|7;y#Hjl*cgkA4h${lK~+-UWL-+ML|>D^xD2<4%Jz)>0}~E
+zRaB3cwziUVbLDR34xSFUTwkI8UHAM4Rjr3N)Rn1zt*pC?RkOagxi+jU{q9KBDizY}
+z&%P>CF}>j2UcXA|eLZbu>V<xMtxBm^dZvG`Qg8Iu>l>AN>oyGhr=IE^H%`u1Gy2ce
+fRaIWIAf{$^`SkW%6~1Nd<tp%go;=U2#n<WsE%1o0
+
+delta 264
+zcmdmXgz51fCce|Wyj%=G@HP2Kmhjw-d^{XX_L7@rIQH`LYv}3e#b_#A*r5;;4P<V9
+zBPzzksi6>~sRI;H*vv1Xz&P1JQj#wxF*hkCQKLdrL06$dVREEo%H(~L+LK>NuGl<T
+zN|$kRqkJ!~g1<(^qoxK;1$~7Gg~_rC3Y+Z|oERsUluB%#srZVS(QtE%sy`cJ=jJQg
+z^SK$5HkX+D=rYQ0KA55}#;CmcW7RV@#{A7U8eMrACvKMOFJWW6x_R<ceMZK+n-5QO
+zWn_FX*>I-FX4x6SjEs+g%=?T7Hw(^6XJLH4xpLkFMs_3C3dRowjGF}(h%@mQu`^13
+MVgQjv(m;;`0DXK`2><{9
+
+diff --git a/src/llm/__pycache__/rag_pipeline.cpython-312.pyc b/src/llm/__pycache__/rag_pipeline.cpython-312.pyc
+index 3c0bff12e10adbc57019019f4ccc7b9e7a061fcb..da6b64768834bb149a4106a118b7c4e03ea53f35 100644
+GIT binary patch
+delta 4458
+zcmZu!d3aPs5>L(X5;7qN2@}YH1DS+8AmLDxs6>h6(u4>Dhy=oX!{h-I=7{|!=w{{k
+zK!H_Qm0oFAMPLOb8w{&Y9Y919#0y~|=n4;H5kvt|V<3v+$8J|Y7u0qB_)T?nb#--B
+zbydIRZ(5JOX^r38yLW69|Mjf;tYO--FU5ae2(z@F!YXjghx%UiHh)Z@*L(@0Oi>R=
+z4?ruRY*f_5C^=3mz3H^MALz-dC+G|NniaR-A8>nu>U|24W9g9MyPSHuO1$}vB;-|8
+z)fb$dA6D)UyS;wJ6I2L!mMfB@=^u+TZGu*#Im1EM6yFGK^ic7mgW{aa$9){<JQ(L(
+zH{np+;N{R06V<B}jwB3PH}X(I_JNpeEqv=I7HFZau^zZhdu8lTk`&=e$X5E=ogQeV
+z{i=q=?BI+RAT6}I>Q%1TR6RQ5Rg|gZAlt}YNWX^g^UB)lRZypWRc*3nyvW(Qm3V@)
+z6*3n^HX{r`*iUUPuX87o#yX_x5Ht?D*+0)uHsWv#UFDh!OSCJls%Y3p@2qW(`xGTC
+zb9`ZyoTLY8OQBusJB`n7rk<HOReNyN0)#UNH3)VD8-lRfZdiR58Rrlf2i>fwVO<J%
+z$Xtc!ra*u^PdjIBhXdM5?@lXdwA$x_c)Hd%bPS%$(B6R5TL^~`@Q`w}p`8akicCYU
+zI1zYtYlzhIxb*^hur`GbXc%d-n6wEE%naT1Y#<#ZY7I_-B&{wuJS8UymygBeeUK7P
+z>qhkw5t{oV*G^wv>;pnGmTZ9Iw0+6nGjv=rlY?sF;8;ZZBO{gzHy6;Dl}_6FU>{gV
+zcRpAk**LQ)l^$Q#pC&&Pl)mMHO=T38rfKURx(;BM*1i-hkU)1oJOsX@Uq76GdphnZ
+zVmJ=9;%RlWs)Wfx9G*gGM)(ZjIt1Y#bd7Fq3^fufo$*LoqBvSA>PkjPq01k6$ku}5
+z191F3?YCk;Vs9i*BJ)!Ojh3(Y6J*i@E2e`}%Uk(giV1*TTHhvph12J?&424>f?aga
+z28Sf#+DaE4PNDzVP!U_oH8q>+9Hfkn-#7)lbkoK$HX+l2OWU;z8~Z?_gG<RKl8P+c
+zo1Qr9pf|qYgnMc23lVsc_SuvRx%8GzvaJneN)eK1Xj8xP(@5UIL5?><FQSe?An$U}
+zt-(-OQAHXMv9CzCn1H9z9Z+Yh<Q0@GqWd;o4>E<8EEuL`w_J?p5lGuw18|-`I<-Gt
+zyloPvKHfGJw$YK>Z-%d_fBOg+OV?~~5iV%jAtI@~-YwT~^N9nMio7pFY6|ki4M0PU
+zbjqcRc2vMc`tFY5P(&~72*Mw<*>6mU;rndclgoEFxn~3~0?BVT@Z&FdJGViEUYs5k
+z%ZcO()P?>v4!0VIUvuEMQ}NVeZZzr^!tWJ%9;Ysesj$cAC-31{c*inV;ZnAsa-Z89
+z3Wk+nn9KmW{(L4(rTOp3uur?^oo;I-7K3JK+Vm;zx}l^5R}bX-%DqJH=`pi>!Fpeq
+z->!=|<v{2`xWIwi(KOS@OrA5V_T|Gy+P-g!2`pOL{({(qH&6zK=-|}hR#Kt44`)C^
+z1=p@aT@7hOHI?+?Ba@+$o;WhfCh}Zt(?&D($xu#Jy_)-Jmp<i&U0hhU>q+jinn`y|
+zn(7``;;Jfhxm{%>h+Yz9$$<*-?vQl|YiZR{nHSckqeT#=ZAUAlr6^iNFCQ(0RPFj>
+zKg7YeH1F(MsT%nX+IiLmOKJ8w5A2}J&J`tMfhKN*XHZ}b{pUG*;?qbzg@DOMI<%g1
+z{KA~3m%c3OjrBvfs)|ytk|$~Lc_;4xGtVyqw|46Md^1l7PgkBD9j8hh9O7rxkprw1
+zV30NF2`DdVd%KpJ%Kwephaq%v;Nj>*T2uiCQWk{y2svnsaDX^F=8~LX+!u|q3;EJv
+zl-f!6UTA=WwBTYkysk~Zm;i80^Y`qwjA`Z5HAKY9+*m)W#X@%Cf~%+3ZL@rS#XT!T
+z0-kV-`8TtqorZpV%=sEFi6Cr6IEEl@tH@+84vT2kWhZ<{D=%lkA<chz8VJk0R@x<}
+zXrKO6Yqp^&zD2Kd;WwWshdE$*Vhapfh$q)$8$GiXp2$r+jYXR{ggV8Eze6e=g<@ta
+zVK?@2-Rkv+RE3C!DlXQCD1^mcPBwgV&0^snVeDQEpt(NeH9Dp^iZ&cq9zhU(*^2JQ
+zZeW<C8vDfv^MXwQa*Qnm7z!U@M04Q#NGBgz;C*(*3d8e0z{M5>5y=YFx(|o@5wNoB
+z(c%o;goCVBf>BPi$uOrAsqtJ!wQ~4H_H?p;NYEd0BJWFJv81Dg|CeD$IJ4Qo_S+$i
+zEs#Kh(UDjil$tY+qSj*wpCF)W+46Jxu!eYkh7Z`|_%}YXH6Ai0>3tOY7dx5)6KxM5
+zUBZ`;dF-aXFgmpz8M_hMIhW^>2>o8RqA#RX|ISuKxZs*ce(enMF={%9fT1($>|q=p
+zVcmT}mhM8jjSaLza-N3tNrY1zbekG#B3{Ma=n2mek<%@L6mOwU=HZS=!pQ5r!Xd9a
+z><jx9vX!l{Lp^vS-`ZiECF3@(=PW+{$RrLjkPnc?ByB2Y>(ik>Q`4b(;4a)#9Q<=m
+z@m_cJ>If&0FW8B6$mDLkk`7MjW?31K3vH}A1JYAPbi2`BBf&9wRno;4WblBVVNYhj
+z5O_ASI|D{V+keD;L`f(?>KkrH4e4MuCrp6#tj-BC#Ij{h7zt<DHYeXIjvaTxojGr#
+z)#A>q$BnEmSGl{&ctO~4Dh}Z-R+A0$r7fuWDRwX$hQUwlN;cdI+atv}ph%D$d2Sfo
+z4=G9f0Ynlw=%$cLzQhG>Y<NBt4$bAX9IczZepLvNR1{4?(HOr+4ZC?8Az8Sfh&`Uq
+zRbP%A$cIrTh>Ms<!fLD3ftKuKYYQMNNfcVq&@BNa?BVP~1u!%bqpb7WrmDOisN`uD
+zUkHO!ckzXCUy_OYVF5G>!;7rCkk=1k@F288A_{*r&(&>r1R6smTt-NUKO1q8D586C
+z<p#9xTDFNZrTpUg5oajkYWQo`;`IdUNfv6*aB(ieKpcu%AzDP9*xF2#d&w6#J(z=T
+z;awuA!yKc@`-D$8s3~k@CD_@BB8UbHD=LC)$cxM<f}jaHBKvNJX8?AvhS5CKY3whf
+z!8sJ$2@!^i&WVSYt)v6@FcZ&xWHrtM>hEEvMneHKMAC|3cMNo}<7F_&fpy<VSZs27
+ze4~f(mx5bWykTD`NLp#hh!l21Ih4RgHm@A2_+Ljk-@culFNb><inJ05BwnO>cyz4H
+zy4f>R)qA_gmANX)+_z6Ittgu$YP1m^@rD)2CyKKTjS!yxxj17dC6f?d#wp?3Cvk|r
+z)nmoy8n-mej#U8v)MGsrun3wW^D1Gr3AV7_Rj_^{`hffu7l~9V;X{5muiDCKk?g3^
+zc+)$KUW}KdImJ~{G2Yjx_<cbo-_0LD0k^Ndl|eO>!jF;iYAA-<)u>x+AmZ%8{Y2QW
+z-Tw|Q!app;l#u+Ld2x|>$-SEJ{7!!|4u;$!?t2U#7|3r+{uMN`->;0E6;^NLaq|%G
+zoR=cE*T6_iqHuw*W-;2jlPz(<kU}&{n8Yo+X3uE8k@4EOHsAXfA0T_!XD%32D6$Nj
+zt#M`Ww*2pPE=v7Oobn)GX6jb{d{piy16lDz$hOJ2hm4bPEHIH5fcGMsCxUEB6A3Ju
+z^*cBlix7jbpM5hK`WJ~0A5q87AlHf~NI(!@J9CgX4u=yEWQ50%H<gXK8~QC=hKv;m
+zD-ps7t8o4~!9(f*!a)S_Q1}R`P6X_mqA3#5yB|c}8RV@%%8m!>%R#q!d4*GXrJ56}
+zH|mfD=SFczBH~*785dx3kt^)X-EbnazcpuFa#s}p+mzgme;3SAQlBmpr@9Ivr>DSX
+ztE~!^48)bm?3p^aXD~KMUGj%!H<2czA8x=|k=Ei?4aH$LyM6|&F@cG7&fu+kI{RS;
+REJ~P|2KMeKL~=Km`Y&Zb%VPil
+
+delta 4365
+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
+M61qYN+2bhnA8v}O^Z)<=
+
+diff --git a/src/llm/prompt_builder.py b/src/llm/prompt_builder.py
+index 9a79133..dcbc1d0 100644
+--- a/src/llm/prompt_builder.py
++++ b/src/llm/prompt_builder.py
+@@ -44,7 +44,7 @@ class PromptBuilder:
+         return balance_math_delimiters(text)
+ 
+     def __init__(self):
+-        self.system_prompt = """Ты — помощник студента факультета прикладной математики и информатики.
++        self.system_prompt = r"""Ты — помощник студента факультета прикладной математики и информатики.
+ 
+ ПРАВИЛА ОТВЕТА:
+ 1. Отвечай ТОЛЬКО на основе предоставленного контекста из книг.
+@@ -81,6 +81,15 @@ class PromptBuilder:
+    Стрелки только канонические: \\to (в блоках) или → (инлайн-Unicode);
+    запрещено ➔ ➡ ⮕. Каждая формула обязана быть замкнутой в пределах ОДНОГО
+    ответа — никогда не выводи открытый $$ без закрывающего.
++9b. АРТЕФАКТЫ ЭКРАНИРОВАНИЯ И MARKDOWN (жёсткое правило, лог Тейлора):
++   СЛЕШИ перед операторами допустимы ТОЛЬКО как начало LaTeX-команды
++   (\frac \to \cdot). ЗАПРЕЩЕНО писать \^ и \_ вне LaTeX-команд:
++   пиши o((x - x_0)^n), а НЕ o((x - x_0)\^n); a_n, а НЕ a\_n.
++   Жирный **обязательно слитно**: сразу после открывающих ** и перед
++   закрывающими ** — непробельный символ: «**n-ю производную**»,
++   а НЕ «** п -ю производную**». Каждый пункт списка обязан содержать
++   текст после маркера; запрещено оставлять пустые строки вида
++   «-  — коэффициент...» или «• » без переменной/слова.
+ 10. МАТЕМАТИЧЕСКАЯ КОРРЕКТНОСТЬ (предел функции по Коши): ЗАПРЕЩЕНО писать
+    X \\ O(x₀) / X \\ U(x₀) (и LaTeX-формы \\setminus) — разность с окрестностью
+    означает «все точки, КРОМЕ окрестности» и переворачивает смысл. Только
+diff --git a/src/llm/rag_pipeline.py b/src/llm/rag_pipeline.py
+index b64ff78..8709a5d 100644
+--- a/src/llm/rag_pipeline.py
++++ b/src/llm/rag_pipeline.py
+@@ -309,7 +309,12 @@ class RAGPipeline:
+                 if lang in ("", "md", "markdown"):
+                     t = body[nl + 1:].strip()
+         from src.llm.prompt_builder import PromptBuilder
+-        return PromptBuilder.math_guard(t)
++        t = PromptBuilder.math_guard(t)
++        # FIX (лог ИИ-кодера 15:1x, Тейлор): косметика ответа LLM —
++        # \^ вне $$-блоков, broken bold («** п -ю производную**»),
++        # пустые маркеры списков. Идемпотентно, KaTeX-блоки не трогает.
++        from src.processing.text_cleaner import sanitize_llm_answer
++        return sanitize_llm_answer(t)
+ 
+     @staticmethod
+     def _fit_context(text: str, budget: int = 14000) -> str:
+diff --git a/src/processing/__pycache__/text_cleaner.cpython-312.pyc b/src/processing/__pycache__/text_cleaner.cpython-312.pyc
+index 80d1ea7b58fce1bcfff6f9bd002539cc24488f3e..6bc23dcff253c7c5e29b7a0243d55439f30f738b 100644
+GIT binary patch
+delta 6198
+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
+bG$V0QET+3`L_yP2_K2F1r+v#k_f7u;*Yb}E
+
+delta 2328
+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
+
+diff --git a/src/processing/text_cleaner.py b/src/processing/text_cleaner.py
+index f3bb562..ebecee2 100644
+--- a/src/processing/text_cleaner.py
++++ b/src/processing/text_cleaner.py
+@@ -393,6 +393,89 @@ def balance_math_delimiters(text: str) -> str:
+     return text
+ 
+ 
++# ---------------------------------------------------------------------------
++# FIX (лог ИИ-кодера 15:1x, Тейлор): постобработка ОТВЕТА LLM.
++# Мелкие модели систематически выдают три артефакта разметки:
++#   1. «лишний слэш» перед операторами LaTeX вне формул и внутри инлайн-блоков:
++#      o((x - x_0)\^n)  ->  o((x - x_0)^n)
++#   2. пустые маркеры списков («•  — коэффициент...», «- » в начале строки без
++#      содержимого) — модель теряет переменную перед тире;
++#   3. broken bold: ** п -ю производную** — пробел после открывающего/перед
++#      закрывающим ** ломает CommonMark (жирный не применяется).
++# Все функции идемпотентны и НЕ трогают валидный LaTeX внутри $$...$$
++# (там \^ — допустимая команда), а также код-блоки ``` ... ```.
++# ---------------------------------------------------------------------------
++
++_RE_LLM_CODEBLOCK = re.compile(r"```.*?```", re.DOTALL)
++
++
++def fix_llm_math_artifacts(text: str) -> str:
++    """Снимает «косой слэш» перед ^/_ только ВНЕ $$-блоков и код-секций.
++
++    Внутри блочной формулы \\^ — легальная KaTeX-команда, её не трогаем;
++    в прозе/инлайн-аргументах (o((x - x_0)\\^n)) это артефакт экранирования.
++    Идемпотентна: повторный вызов ничего не меняет.
++    """
++    if not text or "\\" not in text:
++        return text
++    parts = re.split(r"(\$\$.*?\$\$)", text, flags=re.DOTALL)
++    for i, seg in enumerate(parts):
++        if i % 2 == 1:          # блок формулы — не трогаем
++            continue
++        seg = re.sub(r"\\\^", "^", seg)
++        seg = re.sub(r"\\_(?=[A-Za-z0-9(])", "_", seg)
++        parts[i] = seg
++    return "".join(parts)
++
++
++def fix_llm_bold_spacing(text: str) -> str:
++    """Чинит broken bold: '** текст **' -> '**текст**' (CommonMark требует
++    непробельный символ сразу после ** и перед ним). Только парные маркеры
++    в пределах одной строки; одиночные ** (например в $$-прозе) не трогает."""
++    if "**" not in text:
++        return text
++
++    def _fix_line(line: str) -> str:
++        if line.count("**") % 2:
++            return line  # нечётное число — не угадываем пары
++
++        def _repl(m: re.Match) -> str:
++            body = m.group(1).strip()
++            return f"**{body}**" if body else ""
++
++        # '** текст **' -> '**текст**'; '** **' (пустое содержимое) -> удаляем
++        return re.sub(r"\*\*\s*([^*]*?)\s*\*\*", _repl, line)
++
++    return "\n".join(_fix_line(l) for l in text.split("\n"))
++
++
++def drop_empty_list_items(text: str) -> str:
++    """Удаляет «пустые» строки-маркеры списков, где модель потеряла содержимое:
++      1. маркер без текста вовсе: '• ', '- ', '* ' (только пробелы после);
++      2. висячее тире после маркера: '-  — ' / '- –' (потеряна переменная).
++    Строки вида «— текст» (нормальный пояснительный абзац) НЕ трогает."""
++    text = re.sub(r"(?m)^[ \t]*[•\-\*][ \t]*+(?:[\u2014\u2013][ \t]*)?(?:\n|$)",
++                  "", text)
++    return text
++
++
++def sanitize_llm_answer(text: str) -> str:
++    """Единая постобработка ответа LLM (вызывается из RAGPipeline.answer):
++    1) снятие косых слэшей перед ^/_ вне $$-блоков;
++    2) ремонт broken bold;
++    3) чистка пустых маркеров списков.
++    Идемпотентна, безопасна для KaTeX/CommonMark фронтенда."""
++    if not text:
++        return text
++    try:
++        text = fix_llm_math_artifacts(text)
++        text = fix_llm_bold_spacing(text)
++        text = drop_empty_list_items(text)
++    except Exception as ex:  # косметика никогда не должна ронять ответ
++        logger.warning(f"sanitize_llm_answer: пропуск ({ex})")
++    return text
++
++
+ def normalize_metadata(meta: Any) -> Dict[str, Any]:
+     """Приводит метаданные чанка/узла графа к dict (гарантия типа).
+ 
+-- 
+2.39.5
+

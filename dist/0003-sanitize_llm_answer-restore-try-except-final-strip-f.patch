@@ -1,0 +1,72 @@
+From 4ff9f428366c41a3f4aecbf2f0f040f3e2585a3d Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Fri, 30 Oct 2026 12:54:13 +0000
+Subject: [PATCH 3/3] sanitize_llm_answer: restore try/except + final strip for
+ full-path idempotency; system prompt 9b verified; PROJECT_STATUS session note
+
+---
+ PROJECT_STATUS.md                             |  15 +++++++++++++++
+ .../__pycache__/text_cleaner.cpython-312.pyc  | Bin 35722 -> 35789 bytes
+ src/processing/text_cleaner.py                |   5 ++++-
+ 3 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/PROJECT_STATUS.md b/PROJECT_STATUS.md
+index 0bdfca1..cb3a195 100644
+--- a/PROJECT_STATUS.md
++++ b/PROJECT_STATUS.md
+@@ -95,3 +95,18 @@ num_ctx≈20k возвращает `done_reason='length', eval_count=None, conte
+    отключённым thinking` → непустой ответ (~70 ток/с). Если снова пусто —
+    сработает map→synthesize или summary-апгрейд.
+ 3. Закрепить навсегда (опционально): `ollama.thinking_enabled: false` в config.
++
++## Сессия 2026-10-30 (15:1x) — косметика ответа LLM (лог «Тейлор», оценка ИИ-кодера 10/10 по математике)
++Баги рендеринга из сгенерированного ответа и их лечение (два слоя защиты):
++1. **Постобработка** `src/processing/text_cleaner.py` → `sanitize_llm_answer()` (вызывается в
++   `RAGPipeline._strip_code_fences`, т.е. на ВСЕХ ветках ответа до извлечения источников):
++   - `fix_llm_math_artifacts` — снимает `\^`/`\_` ВНЕ `$$…$$`-блоков (`o((x-x_0)\^n)` → `o((x-x_0)^n)`),
++     валидный LaTeX внутри блоков не трогает;
++   - `fix_llm_bold_spacing` — чинит broken bold `** п -ю производную**` → `**п -ю производную**`
++     (CommonMark требует непробельный символ у маркеров), пустые `** **` удаляются;
++   - `drop_empty_list_items` — вырезает пустые маркеры `- ` / `• ` и висячее тире `-  — `
++     (потерянная переменная), нормальные списки/таблицы/тире-абзацы целы.
++   Все функции идемпотентны (тесты: двойной проход = без изменений).
++2. **System prompt** `prompt_builder.py` — правило **9b**: слеши только как начало LaTeX-команд,
++   жирный слитно, запрет пустых пунктов списка. Докстринг сделан raw-string (убран SyntaxWarning `\c`).
++main.py/запуск не менялись — путь ответа единый через _strip_code_fences, пересборка индекса не нужна.
+diff --git a/src/processing/__pycache__/text_cleaner.cpython-312.pyc b/src/processing/__pycache__/text_cleaner.cpython-312.pyc
+index 13eacae496629f459a6d194a8f762d3ff2d6b004..01039fb5fdb2d2c2582088dec38aa88f8c2ffc5c 100644
+GIT binary patch
+delta 260
+zcmeC0&UAJ<6W?iGUM>b8NSgd4OMUi6zEoaDxy|*wF<y+XCf^AUX3FB7Y#1md6wIK^
+zP{IaM2m&e$MMjeyBkZ8Eo9iQvGBUDHc8$_zEs_VyPcDcuW2~IKJjz6Xhk-|+->TE9
+z+vWm`_>V8#lb=K>>3`rr7XAH!n~~Lx@mH}ZP-~l_Im32NM<eEg43dtz%m;N@9gQ|?
+zM|ZI?KHt18v7Co7XR}_OG$Uj5X0QCMtc-n|N-Y=}r%bjid&M|?vP$_I#+j1^D^@Vp
+oZ{Ah$l#_Ap<^@gvnS})zC1xalU;t7Jl0So}4;q^{wcTI=0H<A21poj5
+
+delta 262
+zcmX>*ovCX&6W?iGUM>b82%P*R>&(oJe5t%Vn)>DWMcKs#iOH$@n@f0Oycjo4z8D^?
+z5X_*=P{IaM3<4?)MJlz7B^(eQ149<~<U~E;$;A<}o7Y4fWn^TVTok1}c~O)ZW9H<W
+zQ6`*h3_Jo2-ao#uPL_>UQoX^=-{AfG11lq|8{@BH5uhP$ikb{7IUU8AH%U4QG9MIV
+zbrjp27v06i_+<0X#Bv_S%*};)(u|A|n|t%OvNCpWb}qGGWSls;rtB5l6eb3SVwuT}
+zWg?Rs$}clcn;cTHg0W`v--@T4jI%aBZu-wG%*QA&Bl!aZkXn%Z8AN?h+WfWc1`7ZV
+ClT=Rt
+
+diff --git a/src/processing/text_cleaner.py b/src/processing/text_cleaner.py
+index bd1f7b0..efc7e58 100644
+--- a/src/processing/text_cleaner.py
++++ b/src/processing/text_cleaner.py
+@@ -478,7 +478,10 @@ def sanitize_llm_answer(text: str) -> str:
+         text = drop_empty_list_items(text)
+     except Exception as ex:  # косметика никогда не должна ронять ответ
+         logger.warning(f"sanitize_llm_answer: пропуск ({ex})")
+-    return text
++    # финальная чистка хвостовых переводов строк — гарантирует идемпотентность
++    # всего пути (_strip_code_fences -> math_guard -> sanitize_llm_answer):
++    # повторный strip() на уже «вымытом» тексте ничего не меняет.
++    return text.strip()
+ 
+ 
+ def normalize_metadata(meta: Any) -> Dict[str, Any]:
+-- 
+2.39.5
+
