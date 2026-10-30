@@ -254,7 +254,7 @@ def run_tk_dialog(dialog_fn):
         import tkinter
     except Exception:  # noqa: BLE001
         return None
-    with tk_root_hidden() as root:
+    with tk_root_hidden():
         try:
             return dialog_fn(tkinter)
         except Exception:  # noqa: BLE001

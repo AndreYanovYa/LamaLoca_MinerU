@@ -20,7 +20,7 @@ def main():
     store = SQLiteStore(settings.sqlite_path)
     router = DocumentRouter()
     
-    print(f"\n=== Тест дедупликации ===")
+    print("\n=== Тест дедупликации ===")
     print(f"Файл: {file_path}")
     
     # Первый импорт
@@ -34,7 +34,7 @@ def main():
     doc2 = router.parse(file_path)
     saved2 = store.save_document(doc2)
     print(f"  Сохранён: {saved2}")
-    print(f"  Ожидалось: False (дубликат)")
+    print("  Ожидалось: False (дубликат)")
     
     # Проверка
     if saved1 and not saved2:
@@ -43,7 +43,7 @@ def main():
         print(f"\n❌ Ошибка: saved1={saved1}, saved2={saved2}")
     
     # Извлечение из БД
-    print(f"\n[3] Извлечение из БД...")
+    print("\n[3] Извлечение из БД...")
     loaded = store.get_document(doc1.doc_id)
     if loaded:
         print(f"  Название: {loaded.title}")

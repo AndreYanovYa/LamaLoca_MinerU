@@ -810,7 +810,8 @@ class RAGPipeline:
                 text_len = len(node.get("text") or "")
                 if total_chars + text_len > budget:
                     break
-                meta = normalize_metadata(node.get("metadata"))
+                # AUDIT (чистка кода): meta был мёртвой переменной — метаданные
+                # узла графа собираются явно в item["metadata"] ниже.
                 item = {
                     "id": bid,
                     "chunk_id": bid,

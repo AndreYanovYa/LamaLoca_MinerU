@@ -33,6 +33,7 @@ Formula Detection/Recognition, Unimernet) находит формулы прям
 """
 from __future__ import annotations
 
+import importlib
 import os
 import re
 import shutil
@@ -105,7 +106,7 @@ class MinerUParser(BaseParser):
         avail = False
         # 1) Корневой пакет импортируется целиком.
         try:
-            import mineru  # noqa: F401
+            importlib.import_module("mineru")  # сам факт импорта и есть проверка
             logger.debug("MinerU: импорт пакета 'mineru' успешен")
             avail = True
         except Exception as e:  # noqa: BLE001 — ловим и ImportError, и прочее
@@ -113,7 +114,8 @@ class MinerUParser(BaseParser):
         # 2) Рабочий Python-API даже при битом корне (частый случай в 3.x).
         if not avail:
             try:
-                from mineru.backend.pipeline.pipeline_analyze import doc_analyze  # noqa: F401
+                importlib.import_module(
+                    "mineru.backend.pipeline.pipeline_analyze")
                 reasons.append("API-подмодуль доступен несмотря на сбой корня")
                 avail = True
             except Exception:  # noqa: BLE001
@@ -381,20 +383,35 @@ class MinerUParser(BaseParser):
 
         pdf_bytes = read_fn(pdf_path)
         kwargs = {}
-        try:  # v3.x: вывод только markdown (без лишних dump'ов), если поддержано
-            import inspect
-            params = set(inspect.signature(do_parse).parameters)
-            if "f_dump_md_only" in params:
-                # FIX (переход к странице из чата): f_dump_md_only вырезал бы
-                # middle.json — единственный источник номеров страниц блоков.
-                # Жёстко не ставим True; ниже явно просим f_dump_middle_json.
-                pass
+
+        # AUDIT (чистка стека, 2026-10-30): сигнатура do_parse меняется в каждом
+        # майноре MinerU (2.5 → 3.x: появились return_layout/return_middle_json,
+        # исчезли/переименовались f_* флаги). Раньше любой неизвестный kwarg
+        # ронял Python-API с TypeError → тихий переход на CLI. Теперь фильтруем
+        # аргументы по реальной сигнатуре функции: передаём только поддерживаемые,
+        # лениво подменяя эквивалентами (middle.json — по любому имени флага).
+        try:
+            import inspect as _inspect
+            params = set(_inspect.signature(do_parse).parameters)
         except Exception:  # noqa: BLE001
-            pass
-        # ВАЖНО: обходим ВСЕ страницы (start/end по умолчанию = весь файл) —
-        # «математика точная наука», частичный разбор запрещён.
-        do_parse(
-            output_dir=str(out_dir),
+            params = None  # не смогли интроспектировать — шлём как есть
+        if params is not None and not any(
+                p.kind == _inspect.Parameter.VAR_KEYWORD for p in
+                _inspect.signature(do_parse).parameters.values()):
+            params = None  # функция принимает только явные аргументы —
+                           # фильтровать не по чему, идём «как есть» (TypeError
+                           # перехватит _run_mineru и переключит на CLI)
+
+        def _supported(**kw):
+            """Оставляет только kwarg'и, присутствующие в сигнатуре do_parse."""
+            if params is None:
+                return kw
+            return {k: v for k, v in kw.items() if k in params}
+
+        middle_flags = _supported(f_dump_middle_json=True,
+                                  return_middle_json=True,
+                                  return_layout=True)
+        common = _supported(
             pdf_file_names=[pdf_path.stem],
             pdf_bytes_list=[pdf_bytes],
             p_lang_list=[self._pick_mineru_lang()],  # один язык, валидный для MinerU
@@ -405,18 +422,21 @@ class MinerUParser(BaseParser):
             f_draw_layout_bbox=False,
             f_draw_span_bbox=False,
             f_dump_md=True,
-            # FIX (переход к странице из чата): middle.json содержит page_idx
-            # каждого блока — единственный точный источник номеров страниц в
-            # MinerU-разборе. Раньше он не выгружался → все блоки уходили в
-            # SQLite/ChromaDB с page_number=None → кнопки источников в чате
-            # были декоративными.
-            f_dump_middle_json=True,
             f_dump_model_output=False,
             f_dump_orig_pdf=False,
             f_dump_content_list=False,
             f_make_md_mode=md_mode,  # MM_MD: markdown с картинками и $$..$$
-            **kwargs,
         )
+        if params is not None and not common:
+            raise ImportError("do_parse: неизвестная сигнатура — переключаемся на CLI")
+        # ВАЖНО: обходим ВСЕ страницы (start/end по умолчанию = весь файл) —
+        # «математика точная наука», частичный разбор запрещён.
+        # FIX (переход к странице из чата): middle.json содержит page_idx
+        # каждого блока — единственный точный источник номеров страниц в
+        # MinerU-разборе; поэтому dump-only режим НЕ включаем, а флаг дампа
+        # среднего JSON запрашиваем под любым именем, который понимает данная
+        # версия пакета (f_dump_middle_json / return_middle_json / return_layout).
+        do_parse(output_dir=str(out_dir), **common, **middle_flags, **kwargs)
 
     def _mineru_cli(self, pdf_path: Path, out_dir: Path) -> None:
         # FIX (лог 16:09): shutil.which видел только PATH; если приложение

@@ -18,11 +18,20 @@ ollama:
   keep_alive_seconds: -1 # Держать модели в VRAM (-1 бессрочно; иначе каждая
                          # серия запросов начинается с медленной загрузки весов)
   gpu_check: true        # Предупреждать при старте, если Ollama считает на CPU
+  # Потолок токенов ВХОДЯЩЕГО промпта (анти-«немой пустой ответ» при KV-кэше
+  # больше реальной ёмкости VRAM). 0 = адаптивный режим: старт 12000 токенов,
+  # автоповышение до 20000 после подтверждения GPU-инференса (~70 ток/с).
+  # Ручной потолок отключает автоповышение (например: 12000 — слабее VRAM,
+  # 20000 — сразу для RTX 5060 8ГБ). Аналог env: OLLAMA_EFFECTIVE_PROMPT_TOKENS.
+  effective_prompt_tokens: 0
+  # Перед запуском MinerU выгружать модели Ollama из VRAM (keep_alive=0s),
+  # чтобы парсер получил всю видеопамять и не ушёл в CPU-режим.
+  unload_for_parse: true
 
 search:
-  fts_top_k: 20
-  vector_top_k: 20
-  final_top_k: 8
+  fts_top_k: 30
+  vector_top_k: 30
+  final_top_k: 16
 
 chunking:
   target_tokens: 500
@@ -48,3 +57,15 @@ offline:
 formula_ocr:
   engine: "auto"
   allow_network_api: false
+
+# --- Движок разбора PDF (MinerU — основной, PyMuPDF — fallback) ---
+# engine: auto | mineru | pymupdf
+pdf_engine:
+  engine: "auto"
+  languages: "ru,en"     # коды языков; для MinerU-OCR выбирается один (ru→cyrillic)
+  # fast_batch: при истине перед парсингом выгружаются модели Ollama, MinerU
+  # запускается на GPU и объявляет карте MINERU_VIRTUAL_VRAM_SIZE = vram_gb_override
+  # (или 16 ГБ по умолчанию) — это поднимает Batch Ratio MinerU с 1 до 8 на
+  # RTX 5060 8ГБ. 0/auto в vram_gb_override = штатный расчёт по реальному объёму.
+  fast_batch: true
+  vram_gb_override: 0    # явный «виртуальный» объём VRAM для Batch Ratio (0 = авто: 16)

@@ -19,7 +19,7 @@ def main():
     file_path = Path(sys.argv[1])
     router = DocumentRouter()
     
-    print(f"\n=== Тест парсинга PDF ===")
+    print("\n=== Тест парсинга PDF ===")
     print(f"Файл: {file_path}")
     print(f"Поддерживается: {router.is_supported(file_path)}")
     print(f"Доступные форматы: {router.supported_extensions()}")
@@ -34,7 +34,7 @@ def main():
         print(f"❌ Файл не найден: {e}")
         sys.exit(1)
     
-    print(f"✅ Успешно!")
+    print("✅ Успешно!")
     print(f"  doc_id:        {doc.doc_id[:32]}...")
     print(f"  Название:      {doc.title}")
     print(f"  Автор:         {doc.author or '—'}")
@@ -44,7 +44,7 @@ def main():
     print(f"  Статус:        {doc.status.value}")
     
     # Показать первые 3 блока
-    print(f"\n--- Первые 3 блока ---")
+    print("\n--- Первые 3 блока ---")
     for block in doc.blocks[:3]:
         preview = block.text[:100].replace("\n", " ")
         print(f"  [{block.block_type.value}] стр.{block.page_number} | {preview}...")

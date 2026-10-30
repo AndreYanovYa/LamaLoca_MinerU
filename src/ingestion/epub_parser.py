@@ -5,7 +5,6 @@ import ebooklib
 from ebooklib import epub
 from bs4 import BeautifulSoup
 import warnings
-import re
 
 # Подавляем предупреждение: EPUB использует XHTML, но HTML-парсер работает нормально
 from bs4 import XMLParsedAsHTMLWarning

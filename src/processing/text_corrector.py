@@ -11,7 +11,6 @@
 LLM не переворачивала смысл определения предела по Коши.
 """
 import re
-from typing import Optional
 
 from .text_cleaner import clean_text as _clean_math_noise
 

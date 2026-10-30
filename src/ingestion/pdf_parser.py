@@ -29,7 +29,6 @@ from .models import ParsedDocument, DocumentBlock, BlockType
 from ..core.exceptions import DocumentParseError
 from ..processing.ocr_processor import OCRProcessor
 from ..processing.text_quality import (
-    assess_document_quality,
     assess_text_quality,
     QUALITY_THRESHOLD,
 )

@@ -16,7 +16,6 @@ import re
 import base64
 import threading
 from pathlib import Path
-from typing import List, Tuple
 
 import matplotlib
 matplotlib.use('Agg')  # Неинтерактивный бэкенд

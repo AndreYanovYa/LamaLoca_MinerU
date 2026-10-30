@@ -136,7 +136,7 @@ class LLMEngine:
                 names = ", ".join(
                     d.get("name", str(d)) if isinstance(d, dict) else str(d)
                     for d in (devs if isinstance(devs, (list, tuple)) else []))
-                logger.info(f"Ollama работает на GPU" + (f": {names}" if names else ""))
+                logger.info("Ollama работает на GPU" + (f": {names}" if names else ""))
                 return True
             if v.get("cuda") is False:
                 logger.warning(
@@ -673,16 +673,18 @@ class LLMEngine:
         tail = prev[-3000:]          # окно поиска пересечения
         head = new[:3000]
         sm = difflib.SequenceMatcher(a=tail, b=head, autojunk=False)
-        best_len, best_j = 0, 0
+        best_len = 0
+        prefix_hit = False  # был матч, доходящий до начала новой порции
         for _i, j, size in sm.get_matching_blocks():
             # считаем только блоки, доходящие до самого начала новой порции —
             # именно они означают «модель повторила хвост предыдущего ответа»
             if j == 0 and size > best_len:
-                best_len, best_j = size, j
+                best_len = size
+                prefix_hit = True
         # Дубликаты часто отличаются одной новой строкой/пробелом на стыке —
         # точная проверка длиннейшего префикса head, встречаемого в tail.
         max_k = min(len(head), len(tail), 2500)
-        for k in range(max_k, best_len, 8):
+        for k in range(max_k, best_len if prefix_hit else 0, 8):
             if tail.endswith(head[:k]):
                 best_len = k
                 break

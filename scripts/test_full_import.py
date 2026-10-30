@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.core.settings import Settings
 from src.ingestion.document_router import DocumentRouter
-from src.ingestion.models import BlockType, IngestionStatus
+from src.ingestion.models import IngestionStatus
 from src.processing.chunker import TextChunker
 from src.storage.sqlite_store import SQLiteStore
 from src.storage.chroma_store import ChromaStore
@@ -173,7 +173,7 @@ def main():
     else:
         print("  ⚠️ FTS5 не нашел совпадений (возможно, слово слишком короткое или стоп-слово).")
 
-    print(f"\n  🔍 Тест Vector Search (поиск по смыслу первого чанка)...")
+    print("\n  🔍 Тест Vector Search (поиск по смыслу первого чанка)...")
     # Берём вектор первого чанка и ищем похожие
     query_embedding = embeddings[0]
     vector_results = chroma_store.search(query_embedding=query_embedding, top_k=3)
