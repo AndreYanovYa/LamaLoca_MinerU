@@ -9,7 +9,7 @@ storage:
 
 ollama:
   base_url: "http://127.0.0.1:11434"
-  chat_model: "qwen3:4b"
+  chat_model: "Qwen3:latest"
   embedding_model: "bge-m3"
   timeout_seconds: 180
   # PERF (устранение «очень медленно»): держать модели в VRAM между запросами.
