@@ -900,6 +900,28 @@ class RAGPipeline:
         if (answer or "").strip():
             return answer
 
+        # FIX (лог 15:12): до слепого повтора того же обречённого запроса —
+        # попытка с ПРИНУДИТЕЛЬНЫМ отключением reasoning (think=False). Если
+        # модель «Qwen3.5-9B»/QwQ съела весь бюджет num_predict скрытыми
+        # thinking-токенами (done_reason='length', eval_count=None, content=''),
+        # именно этот шаг даёт ей шанс ответить по существу. Хранит переключатель
+        # движок (_force_think_off), мы лишь страхуемся явным option'ом.
+        try:
+            forced = [dict(m) for m in messages]
+            opts_backup = getattr(self.llm, "_thinking_override", None)
+            self.llm._thinking_override = False  # think=False для этого запроса
+            try:
+                logger.warning(
+                    "RAG: пустой ответ модели — перезапрос с think=False "
+                    "(отключён скрытый reasoning, съедающий бюджет генерации)")
+                answer = self.llm.chat(forced)
+            finally:
+                self.llm._thinking_override = opts_backup
+            if (answer or "").strip():
+                return answer
+        except Exception as ex:  # noqa: BLE001 — каскад не роняет конвейер
+            logger.debug(f"RAG: шаг think=False не удался ({ex})")
+
         logger.warning("RAG: пустой ответ модели — повторяю запрос один раз")
         answer = self.llm.chat(messages)
         if (answer or "").strip():

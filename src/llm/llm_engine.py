@@ -108,6 +108,9 @@ class LLMEngine:
         # Повторные «немые» length-обрывы с одинаковым запросом бесполезны —
         # считаем их один раз за процесс и подсказываем про think=False.
         self._think_hint_shown = False
+        # FIX (лог 15:12): рантайм-переключатель think=False после зафиксированного
+        # «немого» length-обрыва (eval_count=None). Ставится из _post_chat.
+        self._force_think_off = False
         # FIX (логи 00:56/10:48): динамический бюджет генерации, согласованный
         # с _trim_history (_fit в chat()). Раньше trim резервировал 1024, а
         # options аллоцировали до 4096 — инвариант prompt+predict<=num_ctx
@@ -668,10 +671,18 @@ class LLMEngine:
         reasoning-токены не попадают в content, и при большом промпте модель
         уходит в length-обрыв с ПУСТЫМ ответом (логи 14:55/14:32). Отключение
         thinking — единственный честный ремонт таких «немых» пустот.
-        Ручной override: config.thinking_enabled / env OLLAMA_THINKING."""
+        Ручной override: config.thinking_enabled / env OLLAMA_THINKING.
+
+        FIX (лог 15:12): если движок уже зафиксировал «немой» length-обрыв с
+        eval_count=None (признак съеденного reasoning-бюджета), мы принудительно
+        переключаемся в think=False независимо от имени модели — это спасает
+        кастомные GGUF вроде «Qwen3.5-9B-Q4_K_M», чьё имя может не совпасть с
+        регуляркой, и старые сборки Ollama, где автодетект не срабатывает."""
         if self._thinking_override is not None:
             # override=True означает «thinking нужен» — think не отключаем.
             return False
+        if getattr(self, "_force_think_off", False):
+            return True
         return bool(_THINKING_MODEL_RE.search(model or ""))
 
     def _chat_body(self, model: str, messages: List[Dict[str, Any]],
@@ -712,27 +723,38 @@ class LLMEngine:
             self._pending_gpu_check = False
             self._report_gen_speed(data)
         if done_reason == "length":
+            # AUDIT: разные сборки Ollama кладут метрики то в data["metrics"],
+            # то прямо в корень ответа (eval_count/eval_duration). Читаем оба.
+            metrics = data.get("metrics") or data
+            eval_count = metrics.get("eval_count")
             logger.warning(
                 "Генерация прервана по лимиту length "
-                f"(eval_count={data.get('metrics', {}).get('eval_count')}, "
+                f"(eval_count={eval_count}, "
                 f"num_ctx={options['num_ctx']}, "
                 f"num_predict={options['num_predict']}).")
-            # FIX (логи 14:32/14:55): «немой» length-обрыв с eval_count=None у
-            # Qwen3-подобных моделей — это почти всегда режим thinking: все
-            # токены ушли в скрытое поле reasoning. Если think=False ещё не
-            # применялся (override включал thinking / имя модели не распознано),
-            # подсказываем точную починку и больше не повторяем подсказку.
+            # FIX (логи 14:32/14:55/15:12): «немой» length-обрыв с eval_count=None
+            # у Qwen3-подобных моделей — это почти всегда режим thinking: все
+            # токены ушли в скрытое поле reasoning. Раньше движок только
+            # ПОДСКАЗЫВАЛ пользователю про think=False и продолжал слать тот же
+            # обречённый запрос (лог 15:12: повторные каскады тоже вернули
+            # пустоту — think так и не был применён). Теперь движок сам
+            # принудительно переключается в think=False и сигнализирует
+            # вызывающему коду специальным done_reason='retry_think_off',
+            # чтобы тот тут же повторил генерацию без потери попытки.
             try:
-                if (not content.strip() and data.get("metrics", {})
-                        .get("eval_count") is None
-                        and not getattr(self, "_think_hint_shown", False)
+                if (not content.strip() and eval_count is None
                         and not self._thinking_off(model)):
-                    self._think_hint_shown = True
-                    logger.warning(
-                        "LLM: пустой вывод при полном бюджете похож на режим "
-                        "thinking (Qwen3/QwQ). Отключите reasoning: добавьте в "
-                        "config.yaml ollama.thinking_enabled: false или "
-                        "env OLLAMA_THINKING=0.")
+                    self._force_think_off = True
+                    if not getattr(self, "_think_hint_shown", False):
+                        self._think_hint_shown = True
+                        logger.warning(
+                            "LLM: пустой вывод при полном бюджете похож на "
+                            "режим thinking (Qwen3/QwQ/кастомные GGUF). "
+                            "Модель принудительно переведена в think=False; "
+                            "закрепить навсегда: config.yaml "
+                            "ollama.thinking_enabled: false или env "
+                            "OLLAMA_THINKING=0.")
+                    return content, "retry_think_off"
             except Exception:  # noqa: BLE001 — диагностика не роняет чат
                 pass
         if not content.strip():
@@ -1042,6 +1064,16 @@ class LLMEngine:
         try:
             for attempt in range(MAX_CONTINUATIONS + 1):
                 content, done_reason = self._post_chat(model, cont_messages, options)
+                # FIX (лог 15:12): «немой» length-обрыв с eval_count=None — движок
+                # в _post_chat уже переключил модель в think=False и вернул
+                # sentinel done_reason='retry_think_off'. Повторяем ТОТ ЖЕ запрос
+                # без потери попытки авто-продолжения: теперь reasoning-токены не
+                # съедают бюджет num_predict и content генерируется реально.
+                if done_reason == "retry_think_off":
+                    logger.info(
+                        "LLM: повтор запроса с отключённым thinking "
+                        "(think=False) — reasoning больше не блокирует вывод.")
+                    continue
                 # AUDIT (диагностика «немой» генерации): eval_count=None при
                 # done_reason='length' означает, что llama.cpp НЕ ОТРЕНДЕРИЛ ни
                 # одного токена — запрос физически не влезал в KV-кэш модели.
