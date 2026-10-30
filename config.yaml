@@ -16,6 +16,17 @@ ollama:
   # надёжнее. Значение ниже — безопасный дефолт для слабых машин.
   chat_model: "qwen3:4b"
   embedding_model: "bge-m3"
+  # FIX (логи 14:32/14:55, «Ollama вернула ПУСТОЙ ответ; done_reason='length',
+  # eval_count=None»): Qwen3/QwQ по умолчанию «думают» в скрытом поле thinking,
+  # reasoning-токены съевают бюджет num_predict и content приходит пустым.
+  # Приложение автодетектит такие модели и передаёт think=False — поле можно
+  # оставить закомментированным (авто) или задать явно:
+  #   thinking_enabled: false  — принудительно выключить reasoning для ЛЮБОЙ
+  #       модели (рекомендуется, если пустые ответы повторяются);
+  #   thinking_enabled: true   — оставить thinking (нужен только если модель
+  #       отдаёт reasoning прямо в content).
+  # Аналог без правки конфига: env OLLAMA_THINKING=0.
+  # thinking_enabled: false
   timeout_seconds: 180
   # PERF (устранение «очень медленно»): держать модели в VRAM между запросами.
   # FIX (HTTP 400 'time: missing unit in duration "-1"'): значение -1 («бессрочно»)

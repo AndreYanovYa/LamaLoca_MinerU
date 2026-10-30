@@ -694,6 +694,24 @@ class RAGPipeline:
         messages = self.prompt_builder.build_rag_prompt(
             question, context_chunks, history=_to_dicts(self.history)
         )
+        # FIX (логи 14:32/14:55): большой контекст на грани бюджета модель либо
+        # «глотает» молча (done_reason='length', content='' — KV-кэш не
+        # отрендерен), либо выдаёт оборванный хвост. Поэтому сначала идёт
+        # SAFEGUARD: финальный промпт принудительно вписывается в бюджет
+        # (снятие нерелевантных хвостов, ужимание единственного блока). Если
+        # после этого промпт всё ещё занимает >70% бюджета — включается
+        # двухпроходная схема в духе LangChain Map-Reduce / LlamaIndex
+        # CompactAndRefine:
+        #   проход «map» — по каждому блоку контекста модель извлекает только
+        #     релевантные вопросу тезисы/формулы (короткий промпт, короткий
+        #     ответ — пустота физически невозможна);
+        #   проход «synthesize» — итоговый ответ строится уже по компактным
+        #     выжимкам (~2-4k токенов вместо 16k).
+        # Карта также служит страховкой: если прямой запрос вернул пустоту,
+        # ответ собирается картой. Стоимость карты — +N коротких генераций;
+        # при подтверждённом GPU это секунды на блок.
+        map_notes: List[Dict[str, Any]] = []
+
         # SAFEGUARD (логи 14:32): префлайт выше работает на метрике probe —
         # если из-за сбоя probe_fit/оценки в бой всё равно идёт промпт за
         # пределом ЭФФЕКТИВНОГО бюджета модели, Ollama отвечает молча
@@ -729,7 +747,23 @@ class RAGPipeline:
                     f"блок ужат до бюджета (~{guard_est} ток.)")
             messages = self.prompt_builder.build_rag_prompt(
                 question, context_chunks, history=_to_dicts(self.history))
-        answer = self._chat_with_retry(messages)
+
+        use_map = (guard_est != math.inf and guard_est > hard_budget * 0.7
+                   and len(context_chunks) >= 2)
+
+        answer = ""
+        if use_map:
+            logger.info(
+                f"RAG: контекст {guard_est} ток. (>70% бюджета {hard_budget}) — "
+                f"двухпроходный режим map→synthesize ({len(context_chunks)} "
+                f"блоков) вместо одного перегруженного промпта")
+            answer, map_notes = self._map_reduce_answer(question, context_chunks)
+        if not (answer or "").strip():
+            answer = self._chat_with_retry(messages)
+            if not (answer or "").strip() and not use_map:
+                # Прямой запрос молчит, а карта ещё не пробовалась — пробуем её.
+                answer, map_notes = self._map_reduce_answer(
+                    question, context_chunks)
         answer = self._strip_code_fences(answer)
         # FIX («ИИ-коллаж»): снятие «коллажа» до извлечения источников —
         # изолированные куски с [N] на каждой строке, дубли предложений и
@@ -762,6 +796,90 @@ class RAGPipeline:
                     "sources": sources, "context_chunks": context_chunks}
 
         return {"answer": answer, "sources": sources, "context_chunks": context_chunks}
+
+    # Лимит блоков в карте: лишние (наименее релевантные) просто не участвуют —
+    # их покрытие и так обеспечено соседними блоками после _merge_adjacent.
+    _MAP_MAX_BLOCKS = 6
+    # Жёсткий потолок выжимки на блок (символов): map-ответ заведомо короткий,
+    # поэтому пустота из-за перегруза окна в этом проходе физически невозможна.
+    _MAP_NOTE_CHARS = 900
+
+    def _map_reduce_answer(self, question: str,
+                           context_chunks: List[Dict[str, Any]]
+                           ) -> Tuple[str, List[Dict[str, Any]]]:
+        """Двухпроходный ответ «map → synthesize» (паттерн LangChain
+        Map-Reduce / LlamaIndex CompactAndRefine, адаптированный под локаль).
+
+        Проблема (логи 14:32/14:55): один промпт на 16-21k токенов упирался в
+        лимит KV-кэша/слотов Ollama — модель возвращала done_reason='length'
+        с ПУСТЫМ content, а каскады перезапросов лишь повторяли ту же ошибку.
+        Решение: вместо одного гигантского входа N маленьких входов:
+          1) MAP: для каждого блока контекста — короткий промпт «извлеки из
+             ФРАГМЕНТА только тезисы, определения и формулы, относящиеся к
+             вопросу; если ничего релевантного — верни слово НЕТ». Ответ <=
+             ~200 токенов, никогда не перегружает окно; нерелевантные блоки
+             отсеиваются самой моделью (дешёвая extractive-компрессия, аналог
+             LLMLingua без дополнительной модели).
+          2) SYNTHESIZE: финальный промпт собирается из выжимок (~2-4k
+             токенов) с сохранением [N]-нумерации источников.
+        Возвращает (answer, notes); answer == "" если карта не удалась —
+        вызывающий код продолжит обычный каскад _chat_with_retry.
+        """
+        blocks = context_chunks[:self._MAP_MAX_BLOCKS]
+        if len(blocks) < 2:
+            return "", []
+        notes: List[Dict[str, Any]] = []
+        try:
+            for i, chunk in enumerate(blocks, start=1):
+                text = str(chunk.get("text") or "").strip()
+                if not text:
+                    continue
+                map_msgs = [
+                    {"role": "system", "content":
+                        "Ты — точный экстрактор учебного материала. Отвечай "
+                        "кратко, markdown/LaTeX как в источнике."},
+                    {"role": "user", "content":
+                        f"Вопрос: {question}\n\nФрагмент учебника [{i}]:\n"
+                        f"{text[:6000]}\n\nИзвлеки из фрагмента ТОЛЬКО "
+                        "утверждения, определения, теоремы и формулы "
+                        "(сохрани запись $$...$$), которые относятся к "
+                        "вопросу. Максимум 5 пунктов по одному предложению. "
+                        "Если в фрагменте нет ответа на вопрос — напиши ровно: "
+                        "НЕТ"},
+                ]
+                part = ""
+                try:
+                    part = (self.llm.chat(map_msgs) or "").strip()
+                except Exception as ex:  # noqa: BLE001 — один блок не роняет карту
+                    logger.debug(f"RAG map: блок [{i}] пропущен ({ex})")
+                    continue
+                if not part or part.strip().rstrip(".!").upper() == "НЕТ":
+                    continue
+                notes.append({"idx": i, "note": part[:self._MAP_NOTE_CHARS],
+                              "chunk": chunk})
+            if not notes:
+                return "", []
+            merged = "\n\n".join(
+                f"[{n['idx']}] {n['note']}" for n in notes)
+            syn_msgs = self.prompt_builder.build_rag_prompt(
+                question, [{"text": merged,
+                            "metadata": normalize_metadata(
+                                notes[0]["chunk"].get("metadata"))}],
+                history=_to_dicts(self.history))
+            # Выжимки короче оригинала в 3-6 раз — num_predict можно отдать
+            # полный бюджет генерации: ответ обязан быть содержательным.
+            answer = (self.llm.chat(syn_msgs) or "").strip()
+            if answer:
+                logger.info(
+                    f"RAG map→synthesize: {len(notes)}/{len(blocks)} блоков "
+                    f"дали материал, выжимки {len(merged)} симв. вместо "
+                    f"{sum(len(str(c.get('text') or '')) for c in blocks)} "
+                    f"симв. контекста")
+            return answer, notes
+        except Exception as ex:  # noqa: BLE001 — карта косметична: пустой
+            # возврат передаёт управление обычному каскаду спасения
+            logger.warning(f"RAG: двухпроходный режим не удался ({ex})")
+            return "", []
 
     def _chat_with_retry(self, messages: List[Dict[str, Any]]) -> str:
         """Запрос к LLM с каскадом спасения при пустом выводе.
