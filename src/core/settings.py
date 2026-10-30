@@ -143,10 +143,14 @@ class PdfEngineConfig:
     PyMuPDF — обычный текстовый экстрактор: сложная/инлайн-математика в нём
     превращается в кашу. MinerU анализирует страницы как картинки (layout +
     формульный детектор/распознаватель) и отдаёт Markdown с валидным LaTeX.
-      engine: auto | mineru | pymupdf
+      engine: auto | mineru | pymupdf | pix2text
         auto   — MinerU как основной, PyMuPDF+pix2tex как fallback (рекомендуется);
         mineru — только MinerU (ошибка импорта = ошибка импорта документа);
         pymupdf — старый пайплайн без MinerU.
+        pix2text — Pix2Text (см. src/ingestion/pix2text_parser.py): собственный
+          конвейер Layout+OCR+MFD/MFR, лучше оборачивает ИНЛАЙН-формулы прямо
+          в прозе ("$P_n^{(k)}(x_0)$"); при недоступности пакета — автооткат
+          к auto. Установка: pip install "pix2text[all]" (torch с CUDA уже есть).
       languages: языки для OCR-ветки MinerU (ru,en по умолчанию).
     """
     engine: str = "auto"

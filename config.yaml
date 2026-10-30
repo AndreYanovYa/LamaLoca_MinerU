@@ -91,9 +91,15 @@ formula_ocr:
 # --- Движок разбора PDF (MinerU — основной, PyMuPDF+pix2tex — fallback) ---
 # Синхронизировано с config.example.yaml (FIX: раньше секция была только в
 # примере, и реальный конфиг не давал включить режимы MinerU).
-# engine: auto | mineru | pymupdf
+# engine: auto | mineru | pymupdf | pix2text
 pdf_engine:
   engine: "auto"
+  # pix2text (запрос 2026-10-30): если MinerU оставляет «сырую» инлайн-математику
+  # в прозе (P n^(k)(x 0) = f^(k)(x 0) без $..$), поставьте engine: "pix2text" —
+  # движок Pix2Text с собственным MFD оборачивает формулы прямо в тексте страниц.
+  # Требуется: pip install "pix2text[all]" (модели скачаются при 1-м импорте PDF;
+  # CUDA подхватится автоматически). Без пакета — автооткат к "auto".
+  # ВАЖНО: после смены движка книги нужно ПЕРЕИМПОРТИРОВАТЬ (индекс перестраивается).
   languages: "ru,en"     # коды языков; для MinerU-OCR выбирается один (ru→cyrillic)
   # fast_batch: перед парсингом выгружаются модели Ollama из VRAM
   # (см. ollama.unload_for_parse), MinerU запускается на GPU и объявляет карте

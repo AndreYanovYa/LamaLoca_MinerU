@@ -60,13 +60,32 @@ class DocumentRouter:
             # FIX (лог 22:10): ускорение MinerU (см. PdfEngineConfig).
             _vram_override = int(getattr(pe, "vram_gb_override", 0) or 0)
             _fast_batch = bool(getattr(pe, "fast_batch", True))
+        # FIX (2026-10-30, «сырая математика в прозе»): pdf_engine.engine
+        # теперь принимает и "pix2text" — альтернативный инжест-движок,
+        # оборачивающий инлайн-формулы прямо в потоке текста (MFD внутри P2T).
+        _pix2text_requested = pdf_engine == "pix2text"
+        effective_pdf_engine = "auto" if _pix2text_requested else pdf_engine
         self._parsers: list[BaseParser] = [
-            PDFParser(ocr_processor=ocr_processor, pdf_engine=pdf_engine,
+            PDFParser(ocr_processor=ocr_processor, pdf_engine=effective_pdf_engine,
                       languages=self._pdf_languages,
                       vram_gb_override=_vram_override, fast_batch=_fast_batch),
             EpubParser(),
         ]
-        if pdf_engine in ("auto", "mineru"):
+        if _pix2text_requested:
+            from .pix2text_parser import Pix2TextParser
+            if Pix2TextParser.is_available():
+                # Заменяем PDF-парсер на P2T (ленивая загрузка моделей при 1-м импорте)
+                self._parsers[0] = Pix2TextParser(
+                    ocr_processor=ocr_processor, languages=self._pdf_languages,
+                    vram_gb_override=_vram_override, fast_batch=_fast_batch)
+                logger.info("PDF-движок: Pix2Text (инлайн-MFD) выбрана как основная")
+            else:
+                logger.warning(
+                    "PDF-движок: pix2text НЕ установлена (engine: pix2text) — "
+                    "возврат на auto (MinerU + fallback). Установка: "
+                    "pip install 'pix2text[all]'"
+                )
+        if not _pix2text_requested and pdf_engine in ("auto", "mineru"):
             from .mineru_parser import MinerUParser
             if MinerUParser.is_available():
                 logger.info("PDF-движок: MinerU доступна и будет использована как основная")
