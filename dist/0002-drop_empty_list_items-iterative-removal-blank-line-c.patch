@@ -1,7 +1,7 @@
 From dc82e0070d22eb525126507bee6cf0bad63b5465 Mon Sep 17 00:00:00 2001
 From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
 Date: Fri, 30 Oct 2026 12:53:44 +0000
-Subject: [PATCH 2/3] drop_empty_list_items: iterative removal + blank-line
+Subject: [PATCH 2/4] drop_empty_list_items: iterative removal + blank-line
  collapse -> full pipeline idempotent
 
 ---

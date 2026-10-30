@@ -1,7 +1,7 @@
 From 4ff9f428366c41a3f4aecbf2f0f040f3e2585a3d Mon Sep 17 00:00:00 2001
 From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
 Date: Fri, 30 Oct 2026 12:54:13 +0000
-Subject: [PATCH 3/3] sanitize_llm_answer: restore try/except + final strip for
+Subject: [PATCH 3/4] sanitize_llm_answer: restore try/except + final strip for
  full-path idempotency; system prompt 9b verified; PROJECT_STATUS session note
 
 ---
