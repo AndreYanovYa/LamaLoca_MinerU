@@ -428,12 +428,16 @@ def fix_llm_math_artifacts(text: str) -> str:
         # FIX (лог 23:xx, «Parser Error: Undefined control sequence: \gdef»):
         # LLM иногда вставляет служебные TeX-макросы (\gdef, \edef, \def,
         # \newcommand…) прямо в инлайн-прозу — KaTeX их не определяет и роняет
-        # весь рендер. Вне $$-блоков они всегда артефакт: снимаем бэкслэш,
-        # оставляя читаемый текст («\gdef P_n(x)» → «gdef P_n(x)»). Внутри
-        # $$-блоков макросы легальны — сегменты-формулы пропущены выше.
+        # весь рендер. Вне $$-блоков они всегда артефакт: СНИМАЕМ ВМЕСТЕ С
+        # АРГУМЕНТАМИ («\gdef\foo{1} …» → «…» — раньше оставался мусор
+        # «\foo{1}», который снова валил парсер). Внутри $$-блоков макросы
+        # легальны — сегменты-формулы пропущены выше.
         seg = re.sub(
-            r"\\(?:gdef|edef|xdef|def\b|newcommand\b|renewcommand\b|"
-            r"providecommand\b|let\b|longdef|global\b)(?![A-Za-z])", "", seg)
+            r"\\(?:gdef|edef|xdef|global|longdef)\s*"
+            r"(?:\\[A-Za-z]+\s*)?(?:\{[^{}]*\})?", "", seg)
+        seg = re.sub(
+            r"\\(?:def|newcommand|renewcommand|providecommand|let)\b\s*"
+            r"(?:\\[A-Za-z]+|[A-Za-z])\s*(?:\[[0-9]\])?\s*\{[^{}]*\}", "", seg)
         parts[i] = seg
     return "".join(parts)
 
@@ -659,22 +663,48 @@ class InlineMathNormalizer:
         self._cache[expr] = ok
         return ok
 
+    #: прозаические слова-функции (не математика даже с цифрой-аргументом:
+    #: «n 1 -го порядка», «f 2(x)» — только если это не однобуквенная переменная)
+    _PROSE_WORDS = re.compile(
+        r"^(?:[a-zA-Z]{2,})$")
+
     # ---------------- нормализация кандидата ----------------
-    def _normalize_candidate(self, cand: str) -> Optional[str]:
+    def _normalize_candidate(self, cand: str, left: str = "",
+                             right: str = "") -> Optional[str]:
         s = cand.strip().strip(".,;:")
         if not s:
             return None
         has_script = bool(re.search(r"[\^_]", s))
         has_op = bool(re.search(r"[=<>\u2248\u2264\u2265\u2260]", s))
         has_o = bool(re.search(r"(^|[\s(/+\-])[oO]\s*\(", s))
-        if not (has_script or has_op or has_o):
+        # потерянный индекс/степень в тексте PDF: одиночная переменная + пробел
+        # + цифра («x 0», «P n(x)») — маркер математики. Слева обязан быть
+        # конец слова прозы (пробел; перед ним не цифра, чтобы «… 2025 x 0»
+        # не склеивалось). Справа — конец выражения: разделитель ИЛИ пробел +
+        # строчная кириллица (проза Кудрявцева: «… x 0 , то …», «к x 0
+        # остаточный …», «многочлен P n(x) степени …»). ЗАПРЕЩЁН хвост с
+        # заглавной буквы — это начало нового предложения («f^(k)(x 0). Это
+        # равенство…» остаётся сырым, но безопасным). Числительные («n -ю»)
+        # отсекаются: за цифрой идёт дефис/буква — не математический хвост.
+        _RIGHT_END = r"(?=$|[ \t]*(?:[.,;:!?)\]]|[а-яё]))"
+        has_lost_idx = bool(
+            (re.fullmatch(r"[A-Za-z][ \t]+[0-9]{1,3}", s)
+             or re.fullmatch(r"[A-Za-z][ \t]+[A-Za-z]\([A-Za-z0-9 \t]+\)", s))
+            and re.search(r"[ \t]$", left) is not None
+            and not re.search(r"[0-9][ \t]$", left)
+            and (re.match(_RIGHT_END, right) is not None
+                 or right.strip() == "")   # конец строки без знаков — тоже ок
+        )
+        if not (has_script or has_op or has_o or has_lost_idx):
             return None
         # потерянные индексы (цифровой токен): буква/скобка + пробел + цифра →
-        # «x_0», «r_n» — только если за токеном конец прогона или разделитель
-        # («, ; ) (= < > ≈ ≤ ≥ ≠»). Раньше склейка шла по всему прогону:
-        # «r n(x) = O(...)» превращалось в «r_{n}(x)» (индекс стал аргументом —
-        # подмена смысла), а «P n^(k)(x 0) = f^(k)(x 0)» терял скобки у ^{(k)}.
-        s = re.sub(r"(?<=[A-Za-z0-9)\]])[ \t]+(?=\d{1,4}(?![A-Za-z0-9])(?=$|[ \t,;)=<>≈≤≥≠]))",
+        # «x_0», «r_n». Условие конца: конец прогона, разделитель ИЛИ строчная
+        # кириллица (в прозе «… x 0 , то существует …» после запятой идёт
+        # русское слово — раньше негативный lookahead его не пропускал и
+        # индекс терялся). Буквенный индекс («P n(x)») склеивается только если
+        # за ним явный скрипт/аргумент либо весь кандидат — паттерн
+        # «переменная + индекс» (has_lost_idx выше).
+        s = re.sub(r"(?<=[A-Za-z0-9)\]])[ \t]+(?=\d{1,4}(?![A-Za-z0-9])(?=$|[ \t,;)=<>≈≤≥≠]|[А-Яа-яЁё]))",
                    "_", s)
         # потерянные скрипты с явным маркером: «^ (k)» → '^{(k)}', '_ {0}' и т.п.
         s = re.sub(r"([\^_])[ \t]+(?=[({])", r"\1", s)
@@ -687,6 +717,12 @@ class InlineMathNormalizer:
             if new == s:
                 break
             s = new
+        # одиночная переменная + буквенный индекс с аргументом («P n(x)» →
+        # «P_n(x)») — только когда кандидат ВЕСЬ является таким паттерном
+        # (has_lost_idx); иначе «не выше n ,»/«f имеет n -ю» не трогаем.
+        if has_lost_idx and re.fullmatch(r"[A-Za-z]_[A-Za-z]\([A-Za-z0-9]+\)",
+                                         s.replace(" ", "")):
+            s = re.sub(r"([A-Za-z])[ \t]+([A-Za-z])(?=\()", r"\1_\2", s)
         # «o (…)», «O (…)» — o-нотация: TeX-команда с пробелом («\o »),
         # KaTeX-совместимо; голые «o(x)»/«O(x^n+1)» без пробела тоже легальны,
         # но нормализуем к единому виду только при явном пробеле.
@@ -748,9 +784,10 @@ class InlineMathNormalizer:
         text = re.sub(r"(?<!\\)\$[^$\n]+?\$", _save, text)
         text = re.sub(r"`[^`\n]+?`", _save, text)
 
-        def _repl(m: re.Match) -> str:
+        def _repl(m: re.Match, line: str) -> str:
             raw = m.group(0)
-            cand = self._normalize_candidate(raw)
+            cand = self._normalize_candidate(raw, left=line[:m.start()],
+                                             right=line[m.end():])
             if cand is None:
                 return raw
             if self.validate(cand) is False:
@@ -765,7 +802,7 @@ class InlineMathNormalizer:
             if line.strip().startswith("$$") or "```" in line:
                 out_lines.append(line)
                 continue
-            out_lines.append(self._CAND_RE.sub(_repl, line))
+            out_lines.append(self._CAND_RE.sub(lambda mm: _repl(mm, line), line))
         text = "\n".join(out_lines)
         return re.sub(r"\x00B(\d+)\x00", lambda m: blocks[int(m.group(1))], text)
 
