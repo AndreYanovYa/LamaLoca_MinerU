@@ -478,7 +478,10 @@ def sanitize_llm_answer(text: str) -> str:
         text = drop_empty_list_items(text)
     except Exception as ex:  # косметика никогда не должна ронять ответ
         logger.warning(f"sanitize_llm_answer: пропуск ({ex})")
-    return text
+    # финальная чистка хвостовых переводов строк — гарантирует идемпотентность
+    # всего пути (_strip_code_fences -> math_guard -> sanitize_llm_answer):
+    # повторный strip() на уже «вымытом» тексте ничего не меняет.
+    return text.strip()
 
 
 def normalize_metadata(meta: Any) -> Dict[str, Any]:
