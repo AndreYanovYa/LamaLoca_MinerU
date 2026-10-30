@@ -463,6 +463,21 @@ class MinerUParser(BaseParser):
             "-m", "auto",
             "-l", self._pick_mineru_lang(),
         ]
+        # FIX (чистка стека, 2026-10-30): в CLI MinerU 2.x формулы включены по
+        # умолчанию, но флаг "--formula-only" существует; в 3.x появились
+        # явные --enable_formula/--disable_formula. Определяем поддержку флага
+        # по --help и передаём его, чтобы режим MFD/MFR (LaTeX в markdown)
+        # гарантированно совпадал с Python-API (formula_enable=True). Иначе при
+        # дефолтах новой версии CLI формулы могли молча выключаться.
+        try:
+            help_out = subprocess.run([exe, "--help"], capture_output=True,
+                                      text=True, encoding="utf-8",
+                                      errors="replace", timeout=30)
+            help_text = (help_out.stdout or "") + (help_out.stderr or "")
+            if "--enable_formula" in help_text:
+                cmd.append("--enable_formula")
+        except Exception:  # noqa: BLE001 — help не валяет основной запуск
+            pass
         env = dict(os.environ)
         # FIX (лог 21:39): setdefault + _cuda_available() игнорировали реальную
         # свободную VRAM — при занятой памяти CLI тоже уходил в CPU-квоту 1 ГБ.

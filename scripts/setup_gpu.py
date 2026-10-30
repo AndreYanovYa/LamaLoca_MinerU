@@ -12,6 +12,11 @@ from __future__ import annotations
 
 import subprocess
 
+try:  # модуль-уровень: _warm_check/check_ollama работают с requests напрямую
+    import requests
+except ImportError:  # pragma: no cover
+    requests = None
+
 
 def _run(cmd: str) -> str:
     try:
@@ -92,16 +97,95 @@ def _ollama_fix_steps(reason: str):
     print("       'no compatible GPUs were discovered' — драйвер (у вас 617 — ок) ок,")
     print("       но сборка Ollama не поддерживает CUDA 12.8/sm_120: переустановите её.")
     print("    5) Прогрейте модель и проверьте размещение:")
-    print('       ollama run qwen3.5:4b "/no_think hi"   (подождать ~10 c)')
+    print('       ollama run qwen3:4b "/no_think hi"   (подождать ~10 c)')
     print("       ollama ps   -> PROCESSOR должен быть 100% GPU")
     print("    6) Перезапустите python scripts/setup_gpu.py — секция 3 покажет вердикт.")
 
 
+def _parse_size(v) -> int:
+    """Размер из /api/ps: целое (байты) или строка '4.9 GB'."""
+    if isinstance(v, (int, float)):
+        return int(v)
+    s = str(v or "").strip().upper()
+    mult = {"KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12, "B": 1.0}.get(
+        s.split(" ")[-1] if " " in s else "", 1.0) if s else 1.0
+    try:
+        return int(float(s.split(" ")[0]) * mult)
+    except (ValueError, IndexError):
+        return 0
+
+
+def _warm_check(base: str, model: str) -> bool | None:
+    """Прогрев модели коротким /api/generate (keep_alive="10m"), затем
+    чтение её размещения из /api/ps. Возвращает True/GPU, False/CPU,
+    None — не удалось проверить (Ollama недоступна/таймаут)."""
+    import time
+    try:
+        r = requests.post(f"{base}/api/generate", timeout=120, json={
+            "model": model, "prompt": "hi", "stream": False,
+            "keep_alive": "10m",
+            "options": {"num_predict": 1}})
+        if r.status_code != 200:
+            return None
+    except Exception:
+        return None
+    for _ in range(10):
+        try:
+            ps = requests.get(f"{base}/api/ps", timeout=5).json()
+        except Exception:
+            return None
+        for m in ps.get("models") or []:
+            if m.get("name", "").split(":")[0] != model.split(":")[0]:
+                continue
+            devices = (m.get("details") or {}).get("devices") or []
+            types = {str(d.get("type", "")).lower() for d in devices}
+            if "gpu" in types and len(types) == 1:
+                ids = ", ".join(str(d.get("id")) for d in devices)
+                print(f"  ✓ '{m.get('name')}': после прогрева целиком на GPU "
+                      f"({ids}) — режим OK.")
+                return True
+            if types and "gpu" not in types:
+                print(f"  ✗ '{m.get('name')}': после прогрева считается на CPU — "
+                      "ЭТО CPU-РЕЖИМ.")
+                _ollama_fix_steps(
+                    "сервер Ollama выбрал CPU-бэкенд вместо RTX 5060")
+                return False
+            if types:
+                gid = ", ".join(str(d.get("id")) for d in devices
+                                if str(d.get("type", "")).lower() == "gpu")
+                print(f"  ⚠ '{m.get('name')}': частично GPU ({gid}), частично "
+                      "CPU — VRAM не хватает под весь контекст. Уменьшите "
+                      "num_ctx, включите OLLAMA_FLASH_ATTENTION=1.")
+                return False
+            size, vram = _parse_size(m.get("size")), _parse_size(m.get("size_vram"))
+            if size and vram < size * 0.9:
+                print(f"  ⚠ '{m.get('name')}': лишь ~{int(vram / size * 100)}% "
+                      "весов в VRAM — offload на CPU. Меньше num_ctx или квант "
+                      "помельче.")
+                return False
+            time.sleep(0.5)
+    return None
+
+
+def _read_config_ollama() -> tuple[str, str]:
+    """(base_url, chat_model) из config.yaml рядом со скриптом; дефолты — если нет."""
+    base, model = OLLAMA_BASE, "qwen3:4b"
+    try:
+        import yaml
+        from pathlib import Path
+        cfg_path = Path(__file__).resolve().parent.parent / "config.yaml"
+        raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        ol = raw.get("ollama") or {}
+        base = (ol.get("base_url") or base).rstrip("/")
+        model = ol.get("chat_model") or model
+    except Exception:  # noqa: BLE001 — конфиг опционален
+        pass
+    return base, model
+
+
 def check_ollama():
     print("\n=== 3. Ollama (LLM + эмбеддинги — главный источник скорости) ===")
-    try:
-        import requests
-    except ImportError:
+    if requests is None:
         print("  – requests не установлен")
         return
 
@@ -131,49 +215,57 @@ def check_ollama():
     # ВАЖНО: пустой /api/ps — НЕ признак CPU-режима: так выглядит сервер в
     # простое (модель выгружена по keep_alive). Вердикт о режиме даёт либо
     # флаг cuda из 3a, либо прогретая модель здесь.
+    base_cfg, chat_model = _read_config_ollama()
     try:
-        ps = requests.get(f"{OLLAMA_BASE}/api/ps", timeout=5).json()
+        ps = requests.get(f"{base_cfg}/api/ps", timeout=5).json()
     except Exception:
         print("  – /api/ps недоступен.")
         return
     models = ps.get("models") or []
-    if not models:
-        print("  – Сейчас ни одна модель не загружена в память (/api/ps пуст) —")
-        print("    это состояние простоя, а НЕ доказательство CPU-режима.")
-        if ver_ok:
-            print("    Сборка с CUDA подтверждена флагом выше: после прогрева будет 100% GPU.")
-            print("    Держите ollama.keep_alive_seconds: -1 (config.yaml; код сам")
-            print("    подменит -1 на безопасные \"1h\") — модель не")
-            print("    выгружается и всегда готова на VRAM.")
-        else:
-            print("    Прогрев для точного вердикта: ollama run qwen3.5:4b \"/no_think hi\",")
-            print("    затем ollama ps (PROCESSOR: 100% GPU = OK).")
-        return
+    verdict_given = False
     for m in models:
         name = m.get("name", "?")
-        devices = m.get("details", {}).get("devices") or []
-        size, vram = m.get("size") or 0, m.get("size_vram") or 0
+        devices = (m.get("details") or {}).get("devices") or []
+        size, vram = _parse_size(m.get("size")), _parse_size(m.get("size_vram"))
         gpu_devs = [d for d in devices if str(d.get("type", "")).lower() == "gpu"]
         cpu_devs = [d for d in devices if str(d.get("type", "")).lower() != "gpu"]
         if gpu_devs and not cpu_devs:
             ids = ", ".join(str(d.get("id")) for d in gpu_devs)
             print(f"  ✓ '{name}': целиком на GPU ({ids}) — режим OK.")
+            verdict_given = True
         elif gpu_devs and cpu_devs:
             gid = ", ".join(str(d.get("id")) for d in gpu_devs)
             cid = ", ".join(str(d.get("id")) for d in cpu_devs)
             print(f"  ⚠ '{name}': частично на GPU ({gid}), частично на CPU ({cid}) —")
             print("    VRAM не хватает под весь контекст. Уменьшите num_ctx в config.yaml,")
             print("    поставьте ollama.keep_alive_seconds: 3600 и включите OLLAMA_FLASH_ATTENTION=1.")
+            verdict_given = True
         elif cpu_devs:
             cid = ", ".join(str(d.get("id")) for d in cpu_devs)
             print(f"  ✗ '{name}': считается на {cid} — ЭТО CPU-РЕЖИМ, главная причина")
             print("    медлительности (генерация рвёт $$/**, грузит Ryzen, long-context виснет).")
             _ollama_fix_steps("сервер Ollama выбрал CPU-бэкенд вместо RTX 5060")
+            verdict_given = True
         elif size and vram < size * 0.9:
             print(f"  ⚠ '{name}': лишь ~{int(vram / size * 100)}% весов в VRAM — offload на CPU.")
-            print("    Уменьшите num_ctx или используйте квант помельче (qwen3.5:4b-q4_K_M).")
+            print("    Уменьшите num_ctx или используйте квант помельче (qwen3:4b-q4_K_M).")
+            verdict_given = True
+
+    # 3c. Если ни один источник данных не дал вердикта (cuda-флага нет, а
+    # /api/ps пуст или без details) — САМИ прогреваем чат-модель коротким
+    # запросом и перечитываем размещение (FIX: раньше скрипт тут молчал и
+    # предлагал «проверьте ollama ps вручную»).
+    if not verdict_given and has_cuda is None:
+        if not models:
+            print("  – В памяти сейчас нет моделей (простой) — это НЕ доказательство")
+            print("    CPU-режима. Прогреваю чат-модель из config.yaml (~10–30 c)…")
         else:
-            print(f"  ? '{name}': данных о размещении нет — проверьте 'ollama ps' вручную.")
+            print("  – Сервер не сообщает details размещения — прогреваю модель…")
+        res = _warm_check(base_cfg, chat_model)
+        if res is None:
+            print(f"  ? Прогрев '{chat_model}' не дал данных — проверьте вручную:")
+            print(f'       ollama run {chat_model} "/no_think hi" && ollama ps')
+            print("    PROCESSOR должен быть 100% GPU.")
 
 
 def tips():

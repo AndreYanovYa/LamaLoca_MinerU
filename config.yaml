@@ -9,7 +9,7 @@ storage:
 
 ollama:
   base_url: "http://127.0.0.1:11434"
-  chat_model: "qwen3.5:4b"
+  chat_model: "qwen3:4b"
   embedding_model: "bge-m3"
   timeout_seconds: 180
   # PERF (устранение «очень медленно»): держать модели в VRAM между запросами.
@@ -70,3 +70,24 @@ offline:
 formula_ocr:
   engine: "auto"
   allow_network_api: false
+
+# --- Движок разбора PDF (MinerU — основной, PyMuPDF+pix2tex — fallback) ---
+# Синхронизировано с config.example.yaml (FIX: раньше секция была только в
+# примере, и реальный конфиг не давал включить режимы MinerU).
+# engine: auto | mineru | pymupdf
+pdf_engine:
+  engine: "auto"
+  languages: "ru,en"     # коды языков; для MinerU-OCR выбирается один (ru→cyrillic)
+  # fast_batch: перед парсингом выгружаются модели Ollama из VRAM
+  # (см. ollama.unload_for_parse), MinerU запускается на GPU и объявляет карте
+  # MINERU_VIRTUAL_VRAM_SIZE = vram_gb_override (или 16 ГБ по умолчанию) —
+  # это поднимает Batch Ratio MinerU с 1 до ~2–8 на RTX 5060 8ГБ.
+  # ВНИМАНИЕ (честная настройка под ваше железо): при слишком большом
+  # «виртуальном» объёме батч не влезает в реальные 8 ГБ → CUDA OOM и тихий
+  # откат в CPU-режим. Для RTX 5060 Laptop (8 ГБ) безопасное значение — 8–9.
+  fast_batch: true
+  # FIX (уточнение к комментарию выше): для MinerU-парсинга на RTX 5060 Laptop
+  # безопасный «виртуальный» объём VRAM — реальные 8 ГБ (батч гарантированно
+  # влезает; ratio поднимается с 1 до ~2–4). Ставьте 16 только если видите в
+  # логе CUDA OOM/тихий откат на CPU — наоборот, это его причина.
+  vram_gb_override: 8    # явный «виртуальный» объём VRAM для Batch Ratio (0 = авто: 16)
