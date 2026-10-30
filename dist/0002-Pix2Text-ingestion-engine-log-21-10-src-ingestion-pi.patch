@@ -1,0 +1,358 @@
+From 4f99633c4595c7fde6ad43713825e99ff16506e4 Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Fri, 30 Oct 2026 18:38:26 +0000
+Subject: [PATCH 2/3] =?UTF-8?q?Pix2Text=20ingestion=20engine=20(log=2021:1?=
+ =?UTF-8?q?0:=20=D1=81=D1=8B=D1=80=D0=B0=D1=8F=20=D0=B8=D0=BD=D0=BB=D0=B0?=
+ =?UTF-8?q?=D0=B9=D0=BD-=D0=BC=D0=B0=D1=82=D0=B5=D0=BC=D0=B0=D1=82=D0=B8?=
+ =?UTF-8?q?=D0=BA=D0=B0=20=D0=B2=20=D0=BF=D1=80=D0=BE=D0=B7=D0=B5):=20?=
+ =?UTF-8?q?=D0=BD=D0=BE=D0=B2=D1=8B=D0=B9=20src/ingestion/pix2text=5Fparse?=
+ =?UTF-8?q?r.py=20=D0=BD=D0=B0=D1=81=D0=BB=D0=B5=D0=B4=D1=83=D0=B5=D1=82?=
+ =?UTF-8?q?=20MinerUParser=20=D0=B8=20=D0=BF=D0=BE=D0=B4=D0=BC=D0=B5=D0=BD?=
+ =?UTF-8?q?=D1=8F=D0=B5=D1=82=20=D1=82=D0=BE=D0=BB=D1=8C=D0=BA=D0=BE=20=5F?=
+ =?UTF-8?q?run=5Fmineru=20(=D0=BA=D0=BE=D0=BD=D1=82=D1=80=D0=B0=D0=BA?=
+ =?UTF-8?q?=D1=82=20markdown=20=D1=81=D0=BE=D1=85=D1=80=D0=B0=D0=BD=D1=91?=
+ =?UTF-8?q?=D0=BD=20=E2=80=94=20=D0=B1=D0=BB=D0=BE=D0=BA=D0=B8,=20fallback?=
+ =?UTF-8?q?=20PyMuPDF+pix2tex,=20=D0=BC=D0=B5=D1=82=D0=B0=D0=B4=D0=B0?=
+ =?UTF-8?q?=D0=BD=D0=BD=D1=8B=D0=B5=20=D0=B1=D0=B5=D0=B7=20=D0=B8=D0=B7?=
+ =?UTF-8?q?=D0=BC=D0=B5=D0=BD=D0=B5=D0=BD=D0=B8=D0=B9).=20API=20=D0=BF?=
+ =?UTF-8?q?=D1=80=D0=BE=D0=B2=D0=B5=D1=80=D0=B5=D0=BD=20=D0=BD=D0=B0=20pix?=
+ =?UTF-8?q?2text=201.1.7:=20from=5Fconfig(total=5Fconfigs=3D{'text=5Fformu?=
+ =?UTF-8?q?la':{'languages'}},=20enable=5Fformula/device),=20recognize=5Fp?=
+ =?UTF-8?q?df->Document.to=5Fmarkdown(out=5Fdir);=20=D0=BC=D0=B0=D0=BF?=
+ =?UTF-8?q?=D0=BF=D0=B8=D0=BD=D0=B3=20ru->ch=5Fsim=20(cnocr=20=D0=BA=D0=B8?=
+ =?UTF-8?q?=D1=80=D0=B8=D0=BB=D0=BB=D0=B8=D1=86=D0=B0).=20document=5Froute?=
+ =?UTF-8?q?r:=20pdf=5Fengine.engine=3Dpix2text=20+=20=D0=B0=D0=B2=D1=82?=
+ =?UTF-8?q?=D0=BE=D0=BE=D1=82=D0=BA=D0=B0=D1=82=20=D0=BA=20auto=20=D0=BF?=
+ =?UTF-8?q?=D1=80=D0=B8=20=D0=BE=D1=82=D1=81=D1=83=D1=82=D1=81=D1=82=D0=B2?=
+ =?UTF-8?q?=D0=B8=D0=B8=20=D0=BF=D0=B0=D0=BA=D0=B5=D1=82=D0=B0;=20settings?=
+ =?UTF-8?q?/config=20=D0=B7=D0=B0=D0=B4=D0=BE=D0=BA=D1=83=D0=BC=D0=B5?=
+ =?UTF-8?q?=D0=BD=D1=82=D0=B8=D1=80=D0=BE=D0=B2=D0=B0=D0=BD=D1=8B.=20?=
+ =?UTF-8?q?=D0=A2=D0=B5=D1=81=D1=82=D1=8B:=20=D0=BA=D0=BE=D0=BD=D1=82?=
+ =?UTF-8?q?=D1=80=D0=B0=D0=BA=D1=82=20=5Frun=5Fmineru,=20=D0=B2=D1=8B?=
+ =?UTF-8?q?=D0=B1=D0=BE=D1=80=20=D0=B4=D0=B2=D0=B8=D0=B6=D0=BA=D0=B0=20?=
+ =?UTF-8?q?=D1=80=D0=BE=D1=83=D1=82=D0=B5=D1=80=D0=BE=D0=BC,=20=D0=B0?=
+ =?UTF-8?q?=D0=B2=D1=82=D0=BE=D0=BE=D1=82=D0=BA=D0=B0=D1=82,=20fallback=20?=
+ =?UTF-8?q?=D0=BF=D1=80=D0=B8=20=D0=BF=D0=B0=D0=B4=D0=B5=D0=BD=D0=B8=D0=B8?=
+ =?UTF-8?q?=20P2T.?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ config.yaml                                   |   8 +-
+ requirements.txt                              |   6 +
+ src/core/__pycache__/settings.cpython-312.pyc | Bin 24473 -> 24916 bytes
+ src/core/settings.py                          |   6 +-
+ .../document_router.cpython-312.pyc           | Bin 7277 -> 8011 bytes
+ src/ingestion/document_router.py              |  23 ++-
+ src/ingestion/pix2text_parser.py              | 140 ++++++++++++++++++
+ 7 files changed, 179 insertions(+), 4 deletions(-)
+ create mode 100644 src/ingestion/pix2text_parser.py
+
+diff --git a/config.yaml b/config.yaml
+index 78c883b..48f2f1f 100644
+--- a/config.yaml
++++ b/config.yaml
+@@ -91,9 +91,15 @@ formula_ocr:
+ # --- Движок разбора PDF (MinerU — основной, PyMuPDF+pix2tex — fallback) ---
+ # Синхронизировано с config.example.yaml (FIX: раньше секция была только в
+ # примере, и реальный конфиг не давал включить режимы MinerU).
+-# engine: auto | mineru | pymupdf
++# engine: auto | mineru | pymupdf | pix2text
+ pdf_engine:
+   engine: "auto"
++  # pix2text (запрос 2026-10-30): если MinerU оставляет «сырую» инлайн-математику
++  # в прозе (P n^(k)(x 0) = f^(k)(x 0) без $..$), поставьте engine: "pix2text" —
++  # движок Pix2Text с собственным MFD оборачивает формулы прямо в тексте страниц.
++  # Требуется: pip install "pix2text[all]" (модели скачаются при 1-м импорте PDF;
++  # CUDA подхватится автоматически). Без пакета — автооткат к "auto".
++  # ВАЖНО: после смены движка книги нужно ПЕРЕИМПОРТИРОВАТЬ (индекс перестраивается).
+   languages: "ru,en"     # коды языков; для MinerU-OCR выбирается один (ru→cyrillic)
+   # fast_batch: перед парсингом выгружаются модели Ollama из VRAM
+   # (см. ollama.unload_for_parse), MinerU запускается на GPU и объявляет карте
+diff --git a/requirements.txt b/requirements.txt
+index f59a58a..e81f1bc 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -82,3 +82,9 @@ pytest>=8.3,<9
+ # paddlepaddle/gradio (~1 ГБ) и конфликтуют с torch, если ставить их одним
+ # пакетом. Порядок «torch cu128 -> requirements.txt -> mineru[core]» проверен.
+ # ---------------------------------------------------------------------------
++
++# --- Опционально: альтернативный PDF-движок инжеста (engine: pix2text) ---
++# Ставить ТОЛЬКО если MinerU оставляет «сырую» инлайн-математику в прозе.
++# torch с CUDA должен стоять РАНЬШЕ (шаг 2 выше) — P2T подхватит GPU сам.
++# Модели P2T скачиваются автоматически при первом импорте PDF.
++# pip install "pix2text[all]>=1.1,<2"
+diff --git a/src/core/__pycache__/settings.cpython-312.pyc b/src/core/__pycache__/settings.cpython-312.pyc
+index 8434b8b639e1f59c91e20eb929048c58c6f01fe5..1983ac848d00c719a7b0edf9b423f5cc8f03d8b9 100644
+GIT binary patch
+delta 632
+zcmYjOUr19?7~i=%S%!OwurlJ?ZN^>JHhKs$dWcOQqLGL~khYc#TiG_YD@;l@x4^)l
+z;)Y}~e29FkxzlQ{?GA!aO7J@{dg&$l1JTn&=rQ{4jl}bCIKT7#e!uTKzq3$hjd#rc
+zv7@8iLhHk~@7I^cm+kYNlGn<YI-6`a+=h50bwUlNR6f7o%hIro;cMm*3{Y{1ilB%Y
+zthynY81qD;<Kd(liA6pCrNMY8kqjr?@hMj?5K+fvF(a~A#1hu9CgyOZ9kv%%h)^?&
+zD_9a4I3JpdO{zT?e1kpdK)>G;=pQ@=_*Ue^thkFMF#J##87zodER(Q6vMk_Z%;Qsh
+zfD4#EF7B9&s>qRW4zMmV;yzYU-`Tim-jm%Ma#dvKKrnjwmU6>2t)zlpms56~PXA++
+zfd(w$EApgwkY}B+c}6PLX@H6`0v61W2o?$G#K=;iAhJ7~Rv<K~#@v9<%uEV~6TN|W
+zy_9tvBGIH8nwS9DNb{)i6PE~%%AlyR#Mm{;6MVz|vp`e4Ho_>GBi(ax{eYEO?N(d!
+z5MS$Rw6aw#4;yS<yXpAEgyxqw*=OzK;Xk{+(AOtYv}sr5tJ<RTIs2jYb^m0)xckVe
+z#J2cvWu#4#7$5TV*_oR^IrFlO<@h=OnvFf=djj1yR_3RMeJ$(-pT6j5CB@>1gYE5N
+X2b&h!wpuLGzNSQ{O+Vv}(f8~x9Lyt=
+
+delta 192
+zcmV;x06+iK!U37T0S?Oz4GI7N003%;<ZA3?u@06O0(JwlrWf!5v!NL<0h53n{RIjI
+z2=ErOf*sTZ0mGA5BF_oP0001TasU7TlOQKhlYb+A0nL;CBk=*(lkg<|0o=3iB@Y1s
+z;gkO+=mF-l=qJYl0q?W0DqIEv{s6NMF+~mmDzj8SuLc2svjj%S2my_=%}yl<0kpI8
+uRzm{;s<Ss*Ap`;Pvsqpt0TdSj9Pj`a0UYxK00J2B0v7=s@jSDSU&R629Yux!
+
+diff --git a/src/core/settings.py b/src/core/settings.py
+index d8c3174..968b641 100644
+--- a/src/core/settings.py
++++ b/src/core/settings.py
+@@ -143,10 +143,14 @@ class PdfEngineConfig:
+     PyMuPDF — обычный текстовый экстрактор: сложная/инлайн-математика в нём
+     превращается в кашу. MinerU анализирует страницы как картинки (layout +
+     формульный детектор/распознаватель) и отдаёт Markdown с валидным LaTeX.
+-      engine: auto | mineru | pymupdf
++      engine: auto | mineru | pymupdf | pix2text
+         auto   — MinerU как основной, PyMuPDF+pix2tex как fallback (рекомендуется);
+         mineru — только MinerU (ошибка импорта = ошибка импорта документа);
+         pymupdf — старый пайплайн без MinerU.
++        pix2text — Pix2Text (см. src/ingestion/pix2text_parser.py): собственный
++          конвейер Layout+OCR+MFD/MFR, лучше оборачивает ИНЛАЙН-формулы прямо
++          в прозе ("$P_n^{(k)}(x_0)$"); при недоступности пакета — автооткат
++          к auto. Установка: pip install "pix2text[all]" (torch с CUDA уже есть).
+       languages: языки для OCR-ветки MinerU (ru,en по умолчанию).
+     """
+     engine: str = "auto"
+diff --git a/src/ingestion/__pycache__/document_router.cpython-312.pyc b/src/ingestion/__pycache__/document_router.cpython-312.pyc
+index b74ed8caa841d20f18289f8cf7b5dd828f7108af..e62466c999234d1c2e0974d7c2248817697f64a9 100644
+GIT binary patch
+delta 1423
+zcmZuxZA@EL7`|V<wA|Y-Sxadt+!h#Ipv=Jr$Os#XL%YC`j5xAvP37KhEv3bCTR<(2
+zP5-$W+0mdeCL}IVgFo2n$7F$Q{~RplT%#Ggi6$!XpUF`E>p87#Gw~*U`o2$}=Xu|A
+z+VqdkjUL;E)mlp7=kjk`iMOR|wnmnjGUdBig{jSzDCOe~6g4a41i&aliq4hHikSeB
+zlPAaIMEJSMM|<G6Cb>)iic+C?lVuZoX00@pvnHD0vfXP2PcgX3F+^JDTjKsTQ;FJQ
+z^*AcdZrsA3*=m^P1vtnD>itV}QGp``?OD83)f5GK@u=#gd!l^ShIw0Y6b$kKT7rFi
+zlQZzh6{m7k!~^H}I+HzTPqdMxYWt|u)%awNoIOV+o_u_TVx4m&{6q+ul2MkqR0YqJ
+zoN_UjScRJ9UgxIiX=;WYrKV{)nE$Tid%DyxPsV3jGwMtRE?Vl&0~3ysX~Q;z*%O!@
+ziULgqG6%@*0Y8B%0(c23dji8y-_a2I0$oQp&{t>;t#nDdR;dAVtLP?LM&F>-(7@3?
+zSwh$Kx6n0x4s)w$SwbtgSdq}0egXGu2p%srpI`dl)ZH~D^bvYb(%;Z8=obqqYk2le
+z^kpHhK~0^Fr_?TKS1n7w&b^DL;_R>SY&=)LC>5m9Y$h!=3}7`Fk(#7fG?{!UIyNr1
+z9G1|>{|U!ClE6tRp3*W{Ce`nzpTgbgdYJ(pyt2Vhkg#n2zNL?*y|7C7#A4r7!n=a6
+z%vuygCJT28$j=D=E(B~&gVWSx3^*|X0?;LPhmEqxt~CPGm$RytQ59p48jGo8nfR0%
+znN(tt;$cCM*hrYc7n2PZe{mW~lOzeA6Hn4t^S8wgy83~cs+K<u>s9T@?7J^_e=v2c
+z5t%EuMAzZ~>KTTATWi&AkrJza5<52S{(JUD-QM_vz4@1#{hPskHxAr8G^igM+^lQ6
+zCG41(+5!3<ZoxWleLt!@q#d4emM;kN0;&W*I<zf^d%-qud%!TR)*Y5}KCxX&IcgSP
+zMF;!!`hM7A%P_|nc-1x<dfrdnuJ5&kMe2^<61K2+_Ikn`yUv+#y)Ih9o$R{H6K-SI
+z+f3oke4~Amr}x4SU5(u#a%3(Qolt>TIK7sQ#o{wyA8x=w!mwx6jKL++@sz=9X+W-!
+z8&_Y^Ks}`0L4OAkK0~0NsCgwl7Ktn12w@JxBW@qxOUhvwbyv{m@~^o=jC_nR4=2bh
+zcoaf>8jAtnI_QPEr-i<9rJ|J{fo&CcgM-9KwgSg7$aKM|k-rEmCUiRtcpK;i81~i(
+zBL&HzYy&UA8E>=lH0}*n%K$*~frY>@fo1|PVlcR59Dm-9%g-o4{KZrUsR-EdOFN0-
+zO=_FrOy+HIh&CNq^!!DU_icrNyssDU`kZgWdxn@EW*Fw~iL{bUsy!eMLzVmOVTNx0
+JlOk9U{R5imsUrXY
+
+delta 753
+zcmYjPO-vI(7@g_<6?VI&^0&)&u~a~}EgB1n1`7s5lo}w!_*ab~gk6$0Es)t_IV>m%
+zM-ENCqaL^!V?3C8@Mb&#!Gm&a)Ds6UM$vdNF>z*_sFTc_H{ZPXzR6_vN57m`_d}s(
+zM90th!-8bIP!n9B%GZWDJD`?(*Z~_}z>^>&8n_ca309|MYxfZuvvs?x*jj2^lQHt-
+zLK3P{7X+mqY`|kN36DfMm`5I(?LY|bh*4!6-5Ww^P4Se%8LI6uL!RQHLaNc@fAm5H
+z(@*;><v6_c490_Z+woS_Mr-^!U%?f$%H>c6TW0NL@Bl-#xv$L%5RGQk#ZrFJAuB|n
+zo7yjV9AgbGhMq{FMjgI}4Cq#4s#@n=r?@~OR7YYksb)G!+z(iuBd$a0oU>YXRa$`q
+z^)^n|lHqe$I#k-Xr(P9cqor5=rXZ!`ot}IzC!sk~4mcPdMsfpJ66npzv8D+f?IfBe
+zI=G!dZ6d<$Mg+=t^`@-A?Z&k%;`We`6>8$KWfAv6MN4!iS$BSMuH+EKzlgiCu#jIR
+z19U^u@LDr*AAHo}CVfRjMj2f4b@tNyY~CgpSY;TZx*=v5oq`cv$2V%X^nrkNnN=D|
+zlvy147s7llM<EuAkqkUHPU8pg!ARp72uI(>v&@-haFv3EeW#0=p7?zR;dk^D-h_Vh
+zggoO*rY)6B!gVu+M_|Kjot|Ru1cPf7>U=TpmdPNcPZ42`MotT348nA}Hz{nQqW~`i
+zkCYK%Xj}V%=yJ4<;m{nTckA!o@5(XD--LQFQ(CfDiq0spK|X#qT){Z?o&FP?@<o3D
+DA}+1F
+
+diff --git a/src/ingestion/document_router.py b/src/ingestion/document_router.py
+index daf216f..d914a49 100644
+--- a/src/ingestion/document_router.py
++++ b/src/ingestion/document_router.py
+@@ -60,13 +60,32 @@ class DocumentRouter:
+             # FIX (лог 22:10): ускорение MinerU (см. PdfEngineConfig).
+             _vram_override = int(getattr(pe, "vram_gb_override", 0) or 0)
+             _fast_batch = bool(getattr(pe, "fast_batch", True))
++        # FIX (2026-10-30, «сырая математика в прозе»): pdf_engine.engine
++        # теперь принимает и "pix2text" — альтернативный инжест-движок,
++        # оборачивающий инлайн-формулы прямо в потоке текста (MFD внутри P2T).
++        _pix2text_requested = pdf_engine == "pix2text"
++        effective_pdf_engine = "auto" if _pix2text_requested else pdf_engine
+         self._parsers: list[BaseParser] = [
+-            PDFParser(ocr_processor=ocr_processor, pdf_engine=pdf_engine,
++            PDFParser(ocr_processor=ocr_processor, pdf_engine=effective_pdf_engine,
+                       languages=self._pdf_languages,
+                       vram_gb_override=_vram_override, fast_batch=_fast_batch),
+             EpubParser(),
+         ]
+-        if pdf_engine in ("auto", "mineru"):
++        if _pix2text_requested:
++            from .pix2text_parser import Pix2TextParser
++            if Pix2TextParser.is_available():
++                # Заменяем PDF-парсер на P2T (ленивая загрузка моделей при 1-м импорте)
++                self._parsers[0] = Pix2TextParser(
++                    ocr_processor=ocr_processor, languages=self._pdf_languages,
++                    vram_gb_override=_vram_override, fast_batch=_fast_batch)
++                logger.info("PDF-движок: Pix2Text (инлайн-MFD) выбрана как основная")
++            else:
++                logger.warning(
++                    "PDF-движок: pix2text НЕ установлена (engine: pix2text) — "
++                    "возврат на auto (MinerU + fallback). Установка: "
++                    "pip install 'pix2text[all]'"
++                )
++        if not _pix2text_requested and pdf_engine in ("auto", "mineru"):
+             from .mineru_parser import MinerUParser
+             if MinerUParser.is_available():
+                 logger.info("PDF-движок: MinerU доступна и будет использована как основная")
+diff --git a/src/ingestion/pix2text_parser.py b/src/ingestion/pix2text_parser.py
+new file mode 100644
+index 0000000..aeef340
+--- /dev/null
++++ b/src/ingestion/pix2text_parser.py
+@@ -0,0 +1,140 @@
++# src/ingestion/pix2text_parser.py
++"""Pix2Text-парсер PDF — альтернативный движок инжеста математики.
++
++Назначение (запрос 2026-10-30, «сырая математика в прозе»): MinerU отлично
++даёт структуру и блочные формулы ($$..$$), но инлайн-математика в прозе
++иногда проходит как голый текст ("P n^(k)(x 0) = f^(k)(x 0)"). Pix2Text
++(P2T) имеет собственный конвейер Layout + OCR + MFD/MFR и умеет оборачивать
++инлайн-формулы прямо в потоке текста.
++
++Архитектурное решение: НЕ менять BaseParser/ParsedDocument (стабильные
++контракты всего пайплайна — чанкинг, ChromaDB, UI). Вместо этого класс
++наследуется от MinerUParser и подменяет только метод _run_mineru: вместо
++MinerU он вызывает P2T и возвращает markdown в том же формате, после чего
++весь остальной код (_markdown_to_blocks, fallback на PyMuPDF+pix2tex,
++page_number'ация, метаданные) работает без изменений.
++
++Включение: config.yaml -> pdf_engine.engine: "pix2text"
++(или env LAVALOCA_PDF_ENGINE=pix2text — см. settings/document_router).
++
++Требования: pip install "pix2text[all]" (torch уже стоит с CUDA — P2T
++подхватит GPU автоматически; модели скачиваются при первом запуске).
++"""
++from __future__ import annotations
++
++import logging
++import shutil
++import tempfile
++from pathlib import Path
++
++from .mineru_parser import MinerUParser
++
++logger = logging.getLogger(__name__)
++
++
++class Pix2TextParser(MinerUParser):
++    """PDF-движок на базе Pix2Text, встроенный в MinerU-контракт.
++
++    Языки OCR: ru -> cnocr-код "ch_sim" (Кириллица в P2T поддерживается только
++    им; "en" покрывает латиницу формул). Остальные коды проходят как есть.
++
++    Возвращает ParsedDocument ровно той же структуры, что и MinerU: блоки
++    text/heading/formula/table с LaTeX в $...$ / $$...$$, извлечённые через
++    _markdown_to_blocks(). При недоступности пакета/ошибке P2T поведение
++    совпадает с engine=auto: ошибка логируется, роутер уходит в fallback
++    PyMuPDF+pix2tex (если pdf_engine != "mineru").
++    """
++
++    # ------------------------------------------------------------------ API
++    @staticmethod
++    def is_available() -> bool:
++        """Тихая проверка: пакет pix2text импортируется?"""
++        try:
++            import pix2text  # noqa: F401
++            return True
++        except Exception as e:  # noqa: BLE001
++            logger.debug(f"Pix2Text недоступна: {e}")
++            return False
++
++    def __init__(self, ocr_processor=None, languages: str = "ru,en",
++                 device: str | None = None, **kwargs):
++        super().__init__(ocr_processor=ocr_processor, languages=languages,
++                         **kwargs)
++        self._device = device or self._detect_device()
++        self._p2t = None  # ленивая тяжёлая инициализация (модели ~ГБ)
++
++    @staticmethod
++    def _detect_device() -> str:
++        try:
++            import torch
++            if torch.cuda.is_available():
++                return "cuda"
++        except Exception:  # noqa: BLE001
++            pass
++        return "cpu"
++
++    # ------------------------------------------------------------- основной путь
++    def _run_mineru(self, pdf_path: Path, work_dir: Path):
++        """Переопределение «ядра» MinerUParser: вместо MinerU — Pix2Text.
++
++        Contract MinerUParser (строка ~234 в mineru_parser.py):
++        вернуть (markdown_text, images_dir | None). Всё остальное
++        (_markdown_to_blocks, метаданные, fallback PyMuPDF+pix2tex при
++        pdf_engine=auto) родитель обрабатывает сам — без изменений.
++
++        Проверено на API pix2text 1.1.7:
++          Pix2Text.from_config(total_configs={...}, device=...) — единственный
++          публичный конструктор; языки задаются ТОЛЬКО через total_configs
++          ['text_formula']['languages'] (ключ 'langs' в пакете отсутствует);
++          recognize_pdf() возвращает Document, markdown — через
++          doc.to_markdown(out_dir) (сохраняет output.md и возвращает строку).
++        """
++        from pix2text import Pix2Text
++
++        if self._p2t is None:
++            _P2T_LANG_MAP = {"ru": "ch_sim", "rus": "ch_sim"}  # cnocr: кириллица = ch_sim
++            raw = [s.strip().lower()
++                   for s in str(self.languages or "ru,en").replace(";", ",").split(",")
++                   if s.strip()]
++            langs = tuple(dict.fromkeys(_P2T_LANG_MAP.get(x, x) for x in raw)) or ("en",)
++            logger.info(
++                f"Pix2Text: инициализация движка device={self._device}, "
++                f"languages={list(langs)} (первый запуск скачивает модели P2T)")
++            try:
++                self._p2t = Pix2Text.from_config(
++                    total_configs={"text_formula": {"languages": langs}},
++                    enable_formula=True,   # MFD + MFR: инлайн-формулы → $..$
++                    enable_table=True,     # таблицы → markdown-таблицы (как MinerU)
++                    device=self._device,
++                )
++            except TypeError:
++                # Очень старые/форк-сборки: пробуем минимум аргументов
++                self._p2t = Pix2Text.from_config(device=self._device)
++
++        doc = self._p2t.recognize_pdf(str(pdf_path))
++        out_dir = Path(tempfile.mkdtemp(prefix="lamaloca_p2t_", dir=str(work_dir)))
++        text = ""
++        try:
++            md_val = doc.to_markdown(str(out_dir / "output"))
++            if isinstance(md_val, str):
++                text = md_val
++        except Exception as e:  # noqa: BLE001
++            logger.warning(f"Pix2Text: to_markdown не отработал ({e}) — читаю output.md с диска")
++        if not text.strip():
++            cand = sorted(out_dir.rglob("*.md"), key=lambda p: p.stat().st_size, reverse=True)
++            if cand:
++                try:
++                    text = cand[0].read_text(encoding="utf-8", errors="replace")
++                except Exception:  # noqa: BLE001
++                    pass
++        if not text.strip():
++            raise RuntimeError("Pix2Text вернула пустой markdown")
++
++        # Изображения P2T сохраняет рядом с output.md; передаём каталог родителю,
++        # если он непустой (иначе None — родитель это терпит).
++        imgs_dir = out_dir / "output"
++        has_imgs = imgs_dir.is_dir() and any(imgs_dir.rglob("*.*"))
++        logger.info(f"Pix2Text: получено {len(text)} симв. markdown")
++        return text, (imgs_dir if has_imgs else None)
++
++    # helpers родителя (_count_pages, _markdown_to_blocks, fallback) — наследуются
+-- 
+2.39.5
+
