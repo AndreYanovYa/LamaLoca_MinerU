@@ -1,0 +1,50 @@
+app:
+  name: "lama-loca"
+  language: "ru"
+  # ТЗ «Кастомизация под студента БГУ ФПМиИ»: Ф.И.О. отображается в заголовке
+  # окна; редактируется во вкладке Настройки (сохраняется сюда же).
+  student_name: "Ф.И.О. студента"
+
+storage:
+  root: "data"
+  sqlite_path: "data/storage/library.db"
+  chroma_path: "data/storage/chroma"
+
+ollama:
+  base_url: "http://127.0.0.1:11434"
+  chat_model: "qwen3:4b" # Или Qwen3:latest, как у вас в списке
+  embedding_model: "bge-m3" # Отличная модель, уже загружена у вас!
+  timeout_seconds: 180
+  keep_alive_seconds: -1 # Держать модели в VRAM (-1 бессрочно; иначе каждая
+                         # серия запросов начинается с медленной загрузки весов)
+  gpu_check: true        # Предупреждать при старте, если Ollama считает на CPU
+
+search:
+  fts_top_k: 20
+  vector_top_k: 20
+  final_top_k: 8
+
+chunking:
+  target_tokens: 500
+  overlap_tokens: 100
+  min_tokens: 100
+  max_tokens: 800
+  preserve_headings: true
+  preserve_formulas: true
+  preserve_code_blocks: true
+
+external_tools:
+  tesseract_cmd: "C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
+  djvutxt_cmd: "djvutxt"
+  ddjvu_cmd: "ddjvu"
+  ebook_convert_cmd: "ebook-convert"
+
+offline:
+  enabled: true
+# --- Распознавание формул из PDF (Image-to-LaTeX) ---
+# Текстовый слой PDF превращает математику в нечитаемую кашу; pix2tex/texify
+# распознают PNG-зоны формул в LaTeX, который попадает в обучение и RAG.
+# engine: auto | pix2tex | texify | api | off
+formula_ocr:
+  engine: "auto"
+  allow_network_api: false

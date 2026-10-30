@@ -1,0 +1,84 @@
+# ============================================================================
+# lama-loca v0.2 (MinerU) — актуальный стек зависимостей (пересобран под
+# фактический код проекта: src/**, main.py). Устаревшие комментарии удалены.
+#
+# ПОРЯДОК УСТАНОВКИ НА WINDOWS / RTX 5060 (Blackwell sm_120):
+#   1) python -m venv venv && venv\Scripts\activate
+#   2) CUDA-сборка torch ПЕРВОЙ (обычный pip тянет CPU-torch — MinerU и
+#      pix2tex деградируют на ядра; cu128 — первая сборка со sm_120):
+#        pip install --force-reinstall torch torchvision torchaudio `
+#          --index-url https://download.pytorch.org/whl/cu128
+#   3) остальные зависимости:
+#        pip install -r requirements.txt
+#      (torch уже стоит — pip его не тронет; pillow будет закреплён <13,
+#       что важно для совместимости с gradio из mineru[core])
+#   4) основной PDF-движок MinerU + ОДИН раз скачать модели:
+#        pip install -U "mineru[core]>=2.5,<4"
+#        mineru-models-download          # выбрать pipeline-модели
+#   5) проверка GPU:
+#        python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+#        python scripts/setup_gpu.py     # диагностика Ollama/torch/mineru
+# ============================================================================
+
+# --- UI (Flet 1.x) ---
+flet>=1.0,<2.0
+
+# --- Конфигурация и утилиты ---
+PyYAML>=6.0.2,<7
+requests>=2.32,<3
+platformdirs>=4.3,<5
+loguru>=0.7,<0.10
+tqdm>=4.66,<5
+
+# Точная оценка длины промпта в токенах (анти-«немой» пустой ответ Ollama:
+# эвристика недооценивала русско-математические промпты на 30-50%).
+# Без сети код автоматически падает обратно на консервативную эвристику.
+tiktoken>=0.8,<1
+
+# --- Изображения / рендеринг формул ---
+# <13 обязательно: gradio (зависимость mineru[core]) требует pillow<13.
+Pillow>=11.0,<13
+matplotlib>=3.9,<4          # PNG-рендер формул для экспорта в PDF (mathtext)
+latex2mathml>=3.77.0        # LaTeX (AMS) -> MathML: UI-фолбэки и экспорт
+
+# --- Парсинг документов ---
+PyMuPDF>=1.26,<2            # fallback-движок PDF + привязка номеров страниц
+EbookLib>=0.18,<0.20        # EPUB
+beautifulsoup4>=4.12,<5     # EPUB/HTML
+lxml>=5.3,<7                # парсеры bs4/ebooklib
+
+# --- Распознавание формул (Image-to-LaTeX), fallback-пайплайн PyMuPDF+pix2tex ---
+# Требуется torch (см. шаг 2 выше для GPU-сборки).
+pix2tex[gui]>=0.1.2; python_version < "3.13"
+
+# --- Хранилища ---
+chromadb>=1.0,<2            # sqlite3 — в стандартной библиотеке Python
+
+# --- OCR ---
+pytesseract>=0.3.13,<0.4    # обёртка; бинарник Tesseract ставится отдельно
+                            # (https://github.com/UB-Mannheim/tesseract), путь —
+                            # в config.yaml: ocr.tesseract_cmd
+
+# --- Экспорт ---
+fpdf2>=2.7                  # экспорт ответов в PDF (кириллица, пагинация)
+fonttools>=4.50             # проверка покрытия глифов шрифта (опционально)
+
+# --- Диагностика VRAM для MinerU (RTX 5060) ---
+pynvml>=11.5,<13            # пул свободной VRAM перед включением cuda-режима;
+                            # при отсутствии код молча фолбэкнется на nvidia-smi
+
+# --- Опциональный reranker контекста (рекомендуется) ---
+# Cross-encoder FlashRank (ms-marco-MiniLM-L6-v2, CPU ~30 МБ). Перед усечением
+# контекста до final_top_k поднимает реально отвечающие чанки («А1 из Теста 2»)
+# в начало. rag_pipeline.py работает и без него (чистый RRF).
+flashrank>=0.2.4,<1
+
+# --- Тесты (разработчику) ---
+pytest>=8.3,<9
+
+# ---------------------------------------------------------------------------
+# НЕ добавляйте сюда torch/paddle без index-url cu128 — получите CPU-режим.
+# MinerU сознательно вынесена в отдельный шаг 4: её [core]-extras тянут
+# paddlepaddle/gradio (~1 ГБ) и конфликтуют с torch, если ставить их одним
+# пакетом. Порядок «torch cu128 -> requirements.txt -> mineru[core]» проверен.
+# ---------------------------------------------------------------------------

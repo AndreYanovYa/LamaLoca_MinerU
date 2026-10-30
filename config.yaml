@@ -1,0 +1,72 @@
+app:
+  name: "lama-loca"
+  language: "ru"
+
+storage:
+  root: "data"
+  sqlite_path: "data/storage/library.db"
+  chroma_path: "data/storage/chroma"
+
+ollama:
+  base_url: "http://127.0.0.1:11434"
+  chat_model: "qwen3.5:4b"
+  embedding_model: "bge-m3"
+  timeout_seconds: 180
+  # PERF (устранение «очень медленно»): держать модели в VRAM между запросами.
+  # FIX (HTTP 400 'time: missing unit in duration "-1"'): значение -1 («бессрочно»)
+  # многими сборками Ollama не принимается — приложение автоматически подменит
+  # его на безопасные "1h" (модель реально остаётся в VRAM, ошибок нет).
+  # -1 = бессрочно (кодируется в "1h"); N > 0 = секунд ("Ns");
+  # нет поля / -5 = дефолт сервера (5 минут, модель выгружается
+  # и каждый следующий ответ начинается с медленной повторной загрузки весов).
+  keep_alive_seconds: -1
+  gpu_check: true   # предупреждать о CPU-режиме Ollama/torch при старте
+  # AUDIT (пустой ответ при num_ctx 19-23k): «нативное» окно qwen3.5:4b из
+  # GGUF (262144) — архитектурный потолок RoPE, а не рабочий KV-кэш машины.
+  # Потолок токенов ВХОДЯЩЕГО промпта, при котором модель гарантированно
+  # генерирует, а не молча возвращает пустоту. По умолчанию 12000; на
+  # слабой по VRAM/RAM машине снизьте (например, 8000), на мощной — поднимите.
+  # Аналог: env OLLAMA_EFFECTIVE_PROMPT_TOKENS.
+  # FIX (логи 10:48/11:29 «ответ не раскрывает тему»): 0 = АДAPTIVНЫЙ режим —
+  # старт с консервативных 12000 и автоматическое повышение до 20000 после
+  # того как движок подтвердит GPU-инференс метриками живого ответа (~73 ток/с
+  # на RTX 5060). Любое ненулевое значение = ручной потолок (отключает
+  # автоповышение) — например, верните 12000 при нехватке VRAM или поставьте
+  # 20000 сразу, чтобы не ждать подтверждения GPU первым вопросом.
+  effective_prompt_tokens: 0
+  # FIX (конфликт VRAM, лог 16:39): перед запуском MinerU выгружать модели
+  # Ollama из VRAM (POST /api/chat keep_alive=0s), чтобы парсер получил всю
+  # видеопамять и не уходил в CPU-режим ("GPU Memory: 1 GB"). После импорта
+  # qwen/bge перезагрузятся автоматически при первом вопросе/векторизации.
+  # false — отключить (например, если импорт идёт фоном и чат важен сильнее).
+  unload_for_parse: true
+
+search:
+  fts_top_k: 30
+  vector_top_k: 30
+  final_top_k: 16
+
+chunking:
+  target_tokens: 500
+  overlap_tokens: 100
+  min_tokens: 100
+  max_tokens: 800
+  preserve_headings: true
+  preserve_formulas: true
+  preserve_code_blocks: true
+
+external_tools:
+  tesseract_cmd: "C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
+  djvutxt_cmd: "djvutxt"
+  ddjvu_cmd: "ddjvu"
+  ebook_convert_cmd: "ebook-convert"
+
+offline:
+  enabled: true
+# --- Распознавание формул из PDF (Image-to-LaTeX) ---
+# Текстовый слой PDF превращает математику в нечитаемую кашу; pix2tex/texify
+# распознают PNG-зоны формул в LaTeX, который попадает в обучение и RAG.
+# engine: auto | pix2tex | texify | api | off
+formula_ocr:
+  engine: "auto"
+  allow_network_api: false

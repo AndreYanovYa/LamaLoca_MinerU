@@ -1,0 +1,8 @@
+dist/
+__pycache__/
+*.pyc
+_outbox/
+tests_tmp/
+data/
+venv/
+*.pdf
