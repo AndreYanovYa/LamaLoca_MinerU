@@ -538,24 +538,19 @@ def normalize_bare_math_prose(text: str) -> str:
     text = re.sub(r"\$\$.+?\$\$", _save, text, flags=re.DOTALL)
     text = re.sub(r"(?<!\\)\$[^$\n]+?\$", _save, text)
 
-    # Атом формулы: имя (одна-две латинские буквы, вторая через потерянный
-    # пробел-индекс: «r n», «A k»; перед словом прозы пробел не матчится),
-    # опциональные скрипты ^.../_..., опциональная скобочная часть (…)
-    # с одной вложенностью («O(x^n+1)», «f^(k)(x 0)», «o((x-x_0)^n)»).
     _NAME = r"[A-Za-z](?:[ \t][A-Za-z](?![A-Za-z\u0430-\u04FF])|[A-Za-z0-9])*"
-    _SCRIPTS = r"(?:\^\{?[A-Za-z0-9()+\-]{1,10}\}?|_\{?[A-Za-z0-9](?:[ \t][A-Za-z0-9])?\}?)*"
-    _PARENS = r"(?:\((?:[^()]*|\((?:[^()]*|\([^()]*\))*\))*\))?"
+    # скрипты: одиночные «^n», «_0» НЕ должны поглощать скобку функции —
+    # иначе «T_n(x)» матчалось как «T_n», и остаток «(x)…» разрывал прогон
+    # на куски с вложенными $-блоками (лог 23:xx). Скоба разрешена только
+    # в составе индекса «_{n}» или потерянного индекса «_n n».
+    _SCRIPTS = (r"(?:\^\{?[A-Za-z0-9()+\-]{1,10}\}?|_\{?[A-Za-z0-9]\}?(?!\()"
+                r"|_\{?[A-Za-z0-9][ \t][A-Za-z0-9]\}?)*")
+    # скобочная часть: до двух уровней вложенности; внутри допускаются
+    # потерянные индексы «x 0» (буква+пробел+цифра/буква), иначе greedy-прогон
+    # обрывался на «f^(k)(x» перед « 0)» и весь сегмент не оборачивался.
+    _ATOM_INNER = r"(?:[^()]|[A-Za-z][ \t]+[0-9A-Za-z]|\((?:[^()]|\([^()]*\))*\))*"
+    _PARENS = r"(?:\(" + _ATOM_INNER + r"\))?"
     _TERM = "(?:" + _NAME + _SCRIPTS + _PARENS + ")"
-    # Связки: сначала «сильные» (= ≈ ≤ ≥ ≠), затем слабые (+ − · /) только
-    # между атомами со скриптами/скобками — чтобы «коэффициент + свободный
-    # член» из прозы не склеивался в формулу.
-    seg_re = re.compile(
-        r"(?<![A-Za-z\u0400-\u04FF0-9_$])"
-        + _TERM
-        + r"(?:(?:\s*(?:=|\u2248|\u2264|\u2265|\u2260)\s*|[ \t]*(?:[+\u00b7/]|-(?!\s))[ \t]*)"
-        + _TERM + r")+"
-        + r"(?![A-Za-z\u0400-\u04FF0-9_])"
-    )
 
     def _canon(seg: str) -> str:
         s = seg.strip().rstrip(".,;:")
@@ -575,7 +570,7 @@ def normalize_bare_math_prose(text: str) -> str:
         # «x 0» — пробел перед цифрой после имени = потерянный индекс
         s = re.sub(r"(?<=[A-Za-z])[ \t]+(?=\d)", "_", s)
         # «r n(x)», «P n^(k)» — буква+пробел+буква: потерянный индекс
-        # имени функции (перед \u00ab(\u00bb, \u00ab^\u00bb, \u00ab_\u00bb или на конце сегмента).
+        # имени функции (перед «(», «^», «_» или на конце сегмента).
         s = re.sub(r"(?<=[A-Za-z])[ \t]+(?=[A-Za-z](?:\(|\^|_|\b))", "_", s)
         # «^ (k)» / «^(k)» / «^n» → «^{(k)}» / «^{n}»
         s = re.sub(r"\^\s*\(([^()]{1,8})\)", r"^{\1}", s)
@@ -587,6 +582,51 @@ def normalize_bare_math_prose(text: str) -> str:
         s = _RAW_MATH_FUNC_RE.sub(chr(92) + r"\1", s)
         return fn_pref + s
 
+    # Связки: сначала «сильные» (= ≈ ≤ ≥ ≠), затем слабые (+ − · /) только
+    # между атомами со скриптами/скобками — чтобы «коэффициент + свободный
+    # член» из прозы не склеивался в формулу.
+    _LINK = (r"(?:\s*(?:=|\u2248|\u2264|\u2265|\u2260)\s*|[ \t]*(?:[+\u00b7/]|-(?!\s))[ \t]*)")
+    seg_re = re.compile(
+        r"(?<![A-Za-z\u0400-\u04FF0-9_$])"
+        + _TERM
+        + r"(?:" + _LINK + _TERM + r")+"
+        + r"(?![A-Za-z\u0400-\u04FF0-9_])"
+    )
+    # Одиночные атомы без связки (лог 23:xx: «T_n(x)», «f^{k}» в прозе раньше
+    # оставались сырыми — seg_re требует оператор между TERM). Обёртываются
+    # ТОЛЬКО атомы с явным скриптом ^/_ (уже каноничная математика); атомы вида
+    # «P n(x)» без ^/_ не трогаем — эвристика не отличает их от прозы.
+    single_re = re.compile(
+        r"(?<![A-Za-z\u0400-\u04FF0-9_$])"
+        + _NAME
+        + r"(?:(?:\^\{?[A-Za-z0-9()+\-]{1,10}\}?|_\{?[A-Za-z0-9]\}?)" + _PARENS + _SCRIPTS + _PARENS
+        + r"|" + _SCRIPTS + r"(?:\^\{?[A-Za-z0-9()+\-]{1,10}\}?|_\{?[A-Za-z0-9]\}?)" + _PARENS + ")"
+        + r"(?![A-Za-z\u0400-\u04FF0-9_])"
+    )
+
+    def _wrap(m: re.Match) -> str:
+        run = m.group(0)
+        has_eq = bool(re.search(r"=|\u2248|\u2264|\u2265|\u2260", run))
+        has_scripts = bool(re.search(r"[\^_]", run))
+        if not (has_eq or has_scripts):
+            return run
+        core = _canon(run)
+        if not core:
+            return run
+        # разбаланс скобок = сегмент дописан неполно («f^{k}(x$ 0)») — не трогаем
+        if core.count("(") != core.count(")"):
+            return run
+        return "$" + core + "$"
+
+    def _wrap_single(m: re.Match) -> str:
+        run = m.group(0)
+        if not re.search(r"[\^_]", run):
+            return run
+        core = _canon(run)
+        if not core or core.count("(") != core.count(")"):
+            return run
+        return "$" + core + "$"
+
     out_lines: List[str] = []
     for line in text.split("\n"):
         stripped = line.strip()
@@ -594,21 +634,9 @@ def normalize_bare_math_prose(text: str) -> str:
             out_lines.append(line)
             continue
 
-        def _wrap(m: re.Match) -> str:
-            run = m.group(0)
-            has_eq = bool(re.search(r"=|\u2248|\u2264|\u2265|\u2260", run))
-            has_scripts = bool(re.search(r"[\^_]", run))
-            if not (has_eq or has_scripts):
-                return run
-            core = _canon(run)
-            if not core:
-                return run
-            # разбаланс скобок = сегмент дописан неполно («f^{k}(x$ 0)») — не трогаем
-            if core.count("(") != core.count(")"):
-                return run
-            return "$" + core + "$"
-
-        out_lines.append(seg_re.sub(_wrap, line))
+        line = seg_re.sub(_wrap, line)
+        line = single_re.sub(_wrap_single, line)
+        out_lines.append(line)
     text = "\n".join(out_lines)
     return re.sub(r"\x00BLK(\d+)\x00", lambda m: blocks[int(m.group(1))], text)
 
