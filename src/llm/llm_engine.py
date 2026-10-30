@@ -111,6 +111,14 @@ class LLMEngine:
         # повышает потолок промпта только при ФАКТИЧЕСКИ подтверждённом GPU.
         if verdict is not None:
             self._gpu_mode = verdict
+        # FIX (логи 14:30, «выбрасывает § 13. ФОРМУЛА ТЕЙЛОРА»): /api/ps даёт
+        # size_vram==size ещё ДО первого запроса — это и есть фактическое
+        # подтверждение GPU-режима. Раньше повышение бюджета 12k→20k случалось
+        # только после метрик первой генерации (_report_gen_speed), поэтому
+        # префлайт RAG на ПЕРВОМ вопросе резал контекст до 12k и терял
+        # релевантные блоки. Теперь вердикт сразу пробует поднять бюджет.
+        if verdict is True:
+            self._maybe_raise_budget()
         return verdict
 
     def _check_gpu_impl(self) -> Optional[bool]:

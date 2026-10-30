@@ -19,6 +19,7 @@ RAG-пайплайн с навигацией по структуре докум�
    только через pymupdf (раньше для EPUB оглавление было недоступно).
 """
 import json
+import math
 import re
 from collections import defaultdict
 from difflib import SequenceMatcher
@@ -123,6 +124,9 @@ class RAGPipeline:
 
         # Память диалога: список {"question", "answer"} последних обменов.
         self.history: List[Dict[str, str]] = []
+        # Последний вопрос — для релевантностных эвристик префлайта
+        # (_fit_block_to_budget выбирает окно вокруг «вопросного» места).
+        self._last_question: str = ""
 
     # ------------------------------------------------------------------
     # Управление состоянием
@@ -414,7 +418,130 @@ class RAGPipeline:
         # по формулировке вопроса (название главы учтётся в FTS/векторе).
         return self._handle_semantic_request(question)
 
+    # ------------------------------------------------------------------
+    # FIX (логи 14:30, «пайплайн выбрасывает § 13. ФОРМУЛА ТЕЙЛОРА»):
+    # причина выброса — НЕ ChromaDB: она возвращает чанки целиком и лимитов
+    # токенов не имеет. Контекст раздували склейка соседних блоков
+    # (_merge_adjacent_chunks давал 16633 токена на одном блоке), а префлайт
+    # выкидывал блоки с КОНЦА ранжированного списка — pop() не смотрит на
+    # релевантность и сносил как мусор (указатель «Линия уровня…»), так и
+    # нужное («13.1. ВЫВОД ФОРМУЛЫ ТЕЙЛОРА»). Новые методы:
+    #  1) _protect_relevant — релевантные вопросу блоки никогда не удаляются
+    #     первыми; при перегрузе сначала уходят нерелевантные хвосты;
+    #  2) _fit_block_to_budget — если защищённый блок сам больше бюджета, он
+    #     сокращается ОКНОМ вокруг самой релевантной части (с сохранением
+    #     [N]-маркера блока), а не выбрасывается;
+    #  3) _estimate_full_prompt — честная оценка финального промпта (шаблон +
+    #     история + все блоки) для safe-guard'а перед отправкой в LLM.
+    # ------------------------------------------------------------------
+
+    _STOPWORDS = frozenset("""
+        и в во не ни на по об от до же ли как что это эти тот та мы вы мне мне
+        покажи покажи-ка дай напиши ответь расскажи объясни формулу формула
+        the a an of and or to in for with show give tell explain about
+    """.split())
+
+    def _relevance_score(self, question: str, text: str) -> float:
+        """Быстрая lexical-релевантность блока вопросу (0..1).
+
+        Покрываем словами вопроса (без стоп-слов, с морфологическими префиксами
+        по образцу текста) — этого достаточно, чтобы отличить «формула тейлора
+        + доказательство» от указателя или смежных §29. Работает на символах,
+        без эмбеддингов: дёшево и детерминированно."""
+        qw = re.findall(r"[а-яёa-z0-9]{3,}", (question or "").lower())
+        qw = [w for w in qw if w not in self._STOPWORDS]
+        if not qw:
+            return 0.0
+        tl = (text or "").lower()
+        hits = sum(1 for w in qw if w[:5] in tl or w in tl)
+        return hits / len(qw)
+
+    def _fit_block_to_budget(self, chunk: Dict[str, Any],
+                             max_tokens: int) -> Dict[str, Any]:
+        """Сократить ОДИН релевантный блок до max_tokens окном вокруг самой
+        релевантной части вместо полного выброса (корень потери § 13.1)."""
+        text = str(chunk.get("text") or "")
+        try:
+            est = self.llm.estimate_tokens(
+                [{"role": "user", "content": text}])
+        except Exception:  # noqa: BLE001
+            est = None
+        if est is None:
+            est = max(1, len(text) // 4)
+        if est <= max_tokens or not text:
+            return chunk
+        marker = ""
+        mm = re.match(r"\s*(\[\d+\])\s*", text)
+        if mm:
+            marker = mm.group(1) + "\n"
+            body = text[mm.end():]
+        else:
+            body = text
+        # Символьный бюджет окна: conservatively 0.5*max_tokens (метрика
+        # движка для кириллицы ~1 токен/символ; запас укрощает и сам цикл
+        # префлайта, и safeguard — окно гарантированно влезает в бюджет).
+        ratio = max(0.2, min(1.0, max_tokens / est))
+        keep_chars = min(max(800, int(len(body) * ratio * 0.5)),
+                         int(0.5 * max_tokens))
+        if keep_chars >= len(body):
+            return chunk
+        # Центр окна — позиция самого «вопросного» предложения.
+        center = 0
+        best = -1.0
+        sents = re.split(r"(?<=[.!?])\s+", body)
+        pos = 0
+        for s in sents:
+            sc = self._relevance_score(self._last_question or "", s)
+            if sc > best:
+                best, center = sc, pos
+            pos += len(s) + 1
+        half = keep_chars // 2
+        start = max(0, min(center - half, len(body) - keep_chars))
+        snippet = body[start:start + keep_chars]
+        prefix = "…" if start > 0 else ""
+        suffix = "…" if start + keep_chars < len(body) else ""
+        out = dict(chunk)
+        out["text"] = f"{marker}{prefix}{snippet}{suffix}"
+        logger.info(
+            f"RAG: oversized-блок '{body[:40]}…' ужат "
+            f"{est} → ~{max(1, len(out['text']) // 4)} токенов окном вокруг "
+            f"релевантной части (вместо выброса)")
+        return out
+
+    def _protect_relevant(self, chunks: List[Dict[str, Any]],
+                          question: str) -> List[Dict[str, Any]]:
+        """Переупорядочить блоки так, чтобы префлайт-фильтр (pop с конца)
+        сначала снимал наименее релевантное. Порядок внутри групп сохраняется
+        (стабильная сортировка), маркеры [N] не трогаем — источники
+        извлекаются по ним из context_chunks результата."""
+        if not chunks:
+            return chunks
+        scored = [(self._relevance_score(question, c.get("text", "")), i)
+                  for i, c in enumerate(chunks)]
+        order = sorted(range(len(chunks)), key=lambda i: (-scored[i][0], i))
+        return [chunks[i] for i in order]
+
+    def _estimate_full_prompt(self, question: str,
+                              chunks: List[Dict[str, Any]]) -> int:
+        """Оценка финального промпта (шаблон + история + все блоки). Метрика
+        идентична боевой отправке; исключения наружу не выпускаем — метод
+        вызывается в safe-guard'е перед самим собой же."""
+        try:
+            msgs = self.prompt_builder.build_rag_prompt(
+                question, chunks, history=_to_dicts(self.history))
+            fit = None
+            try:
+                fit = self.llm.probe_fit(msgs)
+            except Exception:  # noqa: BLE001
+                fit = None
+            if fit is not None:
+                return fit[3]
+            return self.llm.estimate_tokens(msgs)
+        except Exception:  # noqa: BLE001
+            return math.inf
+
     def _handle_semantic_request(self, question: str) -> Dict[str, Any]:
+        self._last_question = question
         query_embedding = self.embedder.embed_texts([question])[0]
         # AUDIT ('str' object has no attribute 'items'): нормализация типа
         # элементов на входе каждого канала — та же гарантия, что в summary-
@@ -436,6 +563,11 @@ class RAGPipeline:
         # Склеиваем соседние куски одного раздела в связные блоки (тот же
         # принцип, что и в summary-ветке): модель читает цельный текст.
         context_chunks = _to_dicts(self._merge_adjacent_chunks(context_chunks))
+
+        # FIX (логи 14:30): до бюджетного фильтра поднимаем релевантные
+        # вопросу блоки вверх списка — префлайт удаляет с конца, и теперь
+        # первыми уходят указатели/мусор, а не § 13.1 «Вывод формулы Тейлора».
+        context_chunks = self._protect_relevant(context_chunks, question)
 
         # FIX (логи 13:01 и 14:16, «немой» пустой ответ при перегрузе):
         # контекст должен влезать в ЭФФЕКТИВНЫЙ бюджет модели ещё ДО отправки.
@@ -507,11 +639,54 @@ class RAGPipeline:
                 est = _probe_est(context_chunks)
                 if est <= budget:
                     break
-                dropped = context_chunks.pop()
+                dropped = None
+                # FIX (логи 14:30): не выбрасываем релевантные вопросу блоки.
+                # Ищем наименее релевантный блок, который ещё можно снять без
+                # потери «покрытия» вопросных слов; если такого нет — все
+                # оставшиеся блоки релевантны и снимать их нельзя: вместо
+                # выброса ужимаем самый крупный защищённый блок окном вокруг
+                # релевантной части (_fit_block_to_budget).
+                qwords = set(re.findall(r"[а-яёa-z0-9]{3,}",
+                                        question.lower())) - self._STOPWORDS
+                covered = set()
+                for c in context_chunks:
+                    tl = str(c.get("text") or "").lower()
+                    covered |= {w for w in qwords
+                                if w[:5] in tl or w in tl}
+                for i in range(len(context_chunks) - 1, 0, -1):
+                    tl = str(context_chunks[i].get("text") or "").lower()
+                    own = {w for w in qwords if w[:5] in tl or w in tl}
+                    if not own or (covered - own) == covered:
+                        dropped = context_chunks.pop(i)
+                        covered -= own
+                        break
+                if dropped is None:
+                    # Все блоки несут уникальное покрытие — ужимаем самый
+                    # большой из них (обычно это склеенный § 13 целиком).
+                    big_i = max(range(len(context_chunks)),
+                                key=lambda j: len(
+                                    str(context_chunks[j].get("text") or "")))
+                    room = max(1024, budget // 2)
+                    before_len = len(str(
+                        context_chunks[big_i].get("text") or ""))
+                    context_chunks[big_i] = self._fit_block_to_budget(
+                        context_chunks[big_i], room)
+                    after_len = len(str(
+                        context_chunks[big_i].get("text") or ""))
+                    if after_len >= before_len:
+                        # Ужимать дальше некуда — классический выброс хвоста.
+                        dropped = context_chunks.pop()
+                        logger.info(
+                            f"RAG: контекст ({est} токенов) превышает "
+                            f"эффективный бюджет окна ({budget}) — блок "
+                            f"'{str(dropped.get('text') or '')[:40]}…' "
+                            f"исключён (защита от пустого ответа)")
+                    continue
                 logger.info(
                     f"RAG: контекст ({est} токенов) превышает эффективный "
-                    f"бюджет окна ({budget}) — блок '{str(dropped.get('text') or '')[:40]}…' "
-                    f"исключён (защита от пустого ответа)")
+                    f"бюджет окна ({budget}) — нерелевантный блок "
+                    f"'{str(dropped.get('text') or '')[:40]}…' исключён "
+                    f"(релевантные вопросу блоки защищены)")
         except Exception as ex:
             logger.debug(f"RAG: префлайт-проверка бюджета контекста "
                          f"пропущена ({ex})")
@@ -519,6 +694,41 @@ class RAGPipeline:
         messages = self.prompt_builder.build_rag_prompt(
             question, context_chunks, history=_to_dicts(self.history)
         )
+        # SAFEGUARD (логи 14:32): префлайт выше работает на метрике probe —
+        # если из-за сбоя probe_fit/оценки в бой всё равно идёт промпт за
+        # пределом ЭФФЕКТИВНОГО бюджета модели, Ollama отвечает молча
+        # (done_reason='length', eval_count=None). Проверяем финальный
+        # промпт ещё раз и принудительно срезаем блоки с конца.
+        try:
+            hard_budget = self.llm.effective_prompt_budget()
+        except Exception:  # noqa: BLE001  # старые движки без метода
+            from .llm_engine import _EFFECTIVE_PROMPT_TOKENS as hard_budget  # type: ignore[no-redef]
+        guard_est = self._estimate_full_prompt(question, context_chunks)
+        if guard_est != math.inf and guard_est > hard_budget:
+            # Снятие идёт с конца списка; после _protect_relevant там стоят
+            # наименее релевантные блоки. Если снять все хвосты не хватает и
+            # остаётся единственный защищённый блок — ужимаем его окном
+            # вокруг релевантной части (выбрасывать источник ответа нельзя).
+            while len(context_chunks) > 1:
+                dropped = context_chunks.pop()
+                guard_est = self._estimate_full_prompt(
+                    question, context_chunks)
+                logger.info(
+                    f"RAG: safeguard — финальный промпт ({guard_est} ток.) "
+                    f"превышает бюджет ({hard_budget}) — блок "
+                    f"'{str(dropped.get('text') or '')[:40]}…' снят")
+                if guard_est <= hard_budget:
+                    break
+            if guard_est > hard_budget and context_chunks:
+                context_chunks[0] = self._fit_block_to_budget(
+                    context_chunks[0], hard_budget)
+                guard_est = self._estimate_full_prompt(
+                    question, context_chunks)
+                logger.info(
+                    f"RAG: safeguard — единственный оставшийся релевантный "
+                    f"блок ужат до бюджета (~{guard_est} ток.)")
+            messages = self.prompt_builder.build_rag_prompt(
+                question, context_chunks, history=_to_dicts(self.history))
         answer = self._chat_with_retry(messages)
         answer = self._strip_code_fences(answer)
         # FIX («ИИ-коллаж»): снятие «коллажа» до извлечения источников —

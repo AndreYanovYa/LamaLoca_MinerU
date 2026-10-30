@@ -9,6 +9,11 @@ storage:
 
 ollama:
   base_url: "http://127.0.0.1:11434"
+  # FIX (модель на машине): в C:\Users\Woodpecker_Prime\.ollama\models лежит
+  # Qwen3.5-9B-Q4_K_M (~5.5 ГБ весов) — укажите здесь её точное имя из
+  # `ollama list` (например "qwen3.5:9b" или "Qwen3.5-9B-Q4_K_M:latest").
+  # Движок подбирает tag по префиксу имени (_resolve_model), но точное имя
+  # надёжнее. Значение ниже — безопасный дефолт для слабых машин.
   chat_model: "qwen3:4b"
   embedding_model: "bge-m3"
   timeout_seconds: 180
