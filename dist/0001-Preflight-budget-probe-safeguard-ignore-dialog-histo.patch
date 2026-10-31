@@ -1,0 +1,180 @@
+From 1e0c2e8331ba0a8d417262634512baec2485f3a0 Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Fri, 30 Oct 2026 17:51:59 +0000
+Subject: [PATCH] =?UTF-8?q?Preflight=20budget:=20probe/safeguard=20ignore?=
+ =?UTF-8?q?=20dialog=20history=20(log=2020:43:=20=D0=B8=D1=81=D1=82=D0=BE?=
+ =?UTF-8?q?=D1=80=D0=B8=D1=8F=20=D1=81=D1=8A=D0=B5=D0=B4=D0=B0=D0=BB=D0=B0?=
+ =?UTF-8?q?=20=D0=B1=D1=8E=D0=B4=D0=B6=D0=B5=D1=82=20=D0=B8=20=D1=84=D0=B8?=
+ =?UTF-8?q?=D0=BB=D1=8C=D1=82=D1=80=20=D0=B2=D1=8B=D0=B1=D1=80=D0=B0=D1=81?=
+ =?UTF-8?q?=D1=8B=D0=B2=D0=B0=D0=BB=20=C2=A7=2013.1=20=D0=A4=D0=9E=D0=A0?=
+ =?UTF-8?q?=D0=9C=D0=A3=D0=9B=D0=AB=20=D0=A2=D0=95=D0=99=D0=9B=D0=9E=D0=A0?=
+ =?UTF-8?q?=D0=90);=20=5Festimate=5Ffull=5Fprompt(with=5Fhistory=3DFalse?=
+ =?UTF-8?q?=20default).=20Verified:=20sanitize=5Fllm=5Fanswer=20fixes=20o(?=
+ =?UTF-8?q?(x-x=5F0)\^n)->o((x-x=5F0)^n)=20outside=20$$=20blocks;=20=5Ffit?=
+ =?UTF-8?q?=5Fblock=5Fto=5Fbudget=20keeps=20Taylor=20core=20within=20budge?=
+ =?UTF-8?q?t?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ .../__pycache__/rag_pipeline.cpython-312.pyc  | Bin 90075 -> 90589 bytes
+ src/llm/rag_pipeline.py                       |  44 +++++++++++-------
+ 2 files changed, 26 insertions(+), 18 deletions(-)
+
+diff --git a/src/llm/__pycache__/rag_pipeline.cpython-312.pyc b/src/llm/__pycache__/rag_pipeline.cpython-312.pyc
+index da6b64768834bb149a4106a118b7c4e03ea53f35..4a338602bbbe4705ce272c6ac42430b0d5ed7f25 100644
+GIT binary patch
+delta 3254
+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
+
+delta 2730
+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
+
+diff --git a/src/llm/rag_pipeline.py b/src/llm/rag_pipeline.py
+index 8709a5d..8db84c0 100644
+--- a/src/llm/rag_pipeline.py
++++ b/src/llm/rag_pipeline.py
+@@ -527,13 +527,21 @@ class RAGPipeline:
+         return [chunks[i] for i in order]
+ 
+     def _estimate_full_prompt(self, question: str,
+-                              chunks: List[Dict[str, Any]]) -> int:
+-        """Оценка финального промпта (шаблон + история + все блоки). Метрика
++                              chunks: List[Dict[str, Any]],
++                              *, with_history: bool = False) -> int:
++        """Оценка финального промпта (шаблон + все блоки). Метрика
+         идентична боевой отправке; исключения наружу не выпускаем — метод
+-        вызывается в safe-guard'е перед самим собой же."""
++        вызывается в safe-guard'е перед самим собой же.
++
++        FIX (лог 20:43): история диалога по умолчанию НЕ учитывается — её
++        обрезкой до окна модели занимается llm_engine._trim_history; если бы
++        safeguard считал бюджет вместе с историей, он снимал бы релевантные
++        блоки учебника «про запас», хотя движок сам освобождает место под
++        них. with_history=True остаётся для ручных проверок."""
+         try:
+             msgs = self.prompt_builder.build_rag_prompt(
+-                question, chunks, history=_to_dicts(self.history))
++                question, chunks,
++                history=_to_dicts(self.history) if with_history else None)
+             fit = None
+             try:
+                 fit = self.llm.probe_fit(msgs)
+@@ -615,22 +623,22 @@ class RAGPipeline:
+             # «немого» length-обрыва. Адаптивный (12k старт / 20k после
+             # подтверждения GPU) и не более окна модели минус генерация.
+             budget = max(2048, min(window_cap - gen_reserve, prompt_budget))
+-            # FIX (логи 00:56/10:48): раньше префлайт строил probe БЕЗ
+-            # истории диалога, а реальный запрос — С историей; при втором+
+-            # вопросе оценка занижалась на 1-3k токенов, фильтр пропускал
+-            # перегруз и Ollama снова молчала (eval_count=None,
+-            # done_reason='length'). Теперь метрика probe идентична
+-            # финальному messages.
+-            hist = _to_dicts(self.history)
+-
++            # FIX (лог 20:43, откат идеи 00:56): probe строится БЕЗ истории
++            # диалога. История после первого вопроса занимает 2-6k токенов и
++            # съедала бюджет префлайта — фильтр выбрасывал релевантные блоки
++            # («§ 13. ВЫВОД ФОРМУЛЫ ТЕЙЛОРА…»), хотя llm_engine._trim_history
++            # сам обрезает историю до окна модели перед отправкой в Ollama.
++            # Бюджет префлайта теперь относится к «чистому» RAG-промпту;
++            # история — ответственность движка (окно num_ctx считается с
++            # запасом на генерацию, слоты не переполняются).
+             def _probe_est(chunks):
+-                """Оценка промпта «как в бою»: через probe_fit движка — тот
+-                же chat-шаблон, история и скользящее окно, что реально
+-                уйдут в Ollama (FIX логов 11:29: голова оценка по тексту
+-                контекста занижала метрику на ~15%, и префлайт пропускал
+-                перегруз -> пустые ответы при num_ctx 12-16k)."""
++                """Оценка промпта через probe_fit движка — тот же
++                chat-шаблон и скользящее окно, что реально уйдут в Ollama
++                (FIX логов 11:29: голая оценка по тексту контекста занижала
++                метрику на ~15%, и префлайт пропускал перегруз -> пустые
++                ответы при num_ctx 12-16k)."""
+                 msgs = self.prompt_builder.build_rag_prompt(
+-                    question, chunks, history=hist)
++                    question, chunks, history=None)
+                 fit = None
+                 try:
+                     fit = self.llm.probe_fit(msgs)
+-- 
+2.39.5
+

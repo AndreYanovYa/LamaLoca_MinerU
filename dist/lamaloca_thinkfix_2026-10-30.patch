@@ -1,0 +1,211 @@
+diff --git a/PROJECT_STATUS.md b/PROJECT_STATUS.md
+index 0a57b7f..0bdfca1 100644
+--- a/PROJECT_STATUS.md
++++ b/PROJECT_STATUS.md
+@@ -52,3 +52,46 @@ fea6e50/a248ddb — LaTeX-рендер в чате + кавычки; a3cb8b8 —
+ 5. **MinerU CLI-флаг формул.** Python-API передаёт formula_enable=True; для CLI-пути добавлена передача `--enable_formula` (только если флаг присутствует в `mineru --help` — совместимость 2.5–3.x через динамическую проверку).
+ 6. **Порядок VRAM (справка):** перед импортом книги release_vram выгружает qwen+bge (unload_for_parse:true), MinerU получает всю карту; после импорта модели перезагрузятся сами при первом вопросе/векторизации. При активном парсинге чат будет «медленно стартует» — это ожидаемо (повторная загрузка весов).
+ 7. Все модули: py_compile OK. Старые чанки книг, импортированных до фикса text_cleaner, всё ещё требуют ПЕРЕИМПОРТА (см. пункт «Что осталось сделать»).
++
++## Сессия 2026-10-30 (15:12): «немой» пустой ответ при полном окне — корневая починка thinking
++
++### Симптом (лог)
++`qwen3.5:4b` (на машине реально лежит кастомный GGUF `Qwen3.5-9B-Q4_K_M`) при
++num_ctx≈20k возвращает `done_reason='length', eval_count=None, content=''`.
++Каскады спасения (`_chat_with_retry`, авто-продолжение) лишь повторяли тот же
++обречённый запрос — подсказка про `think=False` выводилась в лог, но никогда
++не применялась автоматически.
++
++### Корень
++Семейство Qwen3/QwQ по умолчанию генерирует скрытые reasoning-токены в поле
++`thinking`; они съевают весь бюджет `num_predict`, и в `content` не попадает
++ни одного токена → Ollama отвечает exactly как в логах. Для кастомных имён
++(`Qwen3.5-9B...`) автодетект по регулярке мог не сработать, а ручного ремонта
++не происходило.
++
++### Исправления (проверено py_compile)
++1. **llm_engine.py**: рантайм-переключатель `_force_think_off` — при первом же
++   «немом» length-обрыве (eval_count=None, пустой content) движок сам ставит
++   think=False и возвращает sentinel `done_reason='retry_think_off'`; цикл
++   `chat()` тут же повторяет запрос без потери попытки продолжения. Метрики
++   читаются теперь из `data['metrics']` ИЛИ корня ответа (разные сборки).
++2. **rag_pipeline.py** `_chat_with_retry`: перед слепым повтором добавлен шаг
++   принудительного think=False (временная установка `_thinking_override`).
++3. **config.yaml**: чат-модель переключена на `qwen3.5:9b` (реальный тег на
++   машине; движок всё равно подберёт его по префиксу через `_resolve_model`).
++
++### Вердикт по предложенной матрице решений
++| Технология | Нужна ли здесь | Комментарий |
++|---|---|---|
++| Corrective RAG (CRAG) | Частично уже есть | Гибридный поиск + FlashRank-reranker + графовое расширение + preflight-защита релевантных блоков (_protect_relevant/_fit_block_to_budget). Полноценный CRAG-критик («оценка релевантности чанков моделью до генерации») избыточен на 8 ГБ VRAM: каждый лишний LLM-проход = +N секунд. |
++| Late Chunking & KV-Fix | Уже внедрено | Инвариант prompt+num_predict+reserve ≤ num_ctx ≤ реальный window (detect_model_window + adaptive budget 12k→20k), keep_alive=-1→"1h", unload_for_parse. KV-сбои лечатся retry_think_off + reduced_cap каскадом. |
++| GraphRAG | Не нужен как замена | Локальный entity_relations/REFERENCES уже реализован (Этапы 2–3); полная пересборка индекса в граф — высокая цена, низкая отдача для учебников с явной нумерацией §. |
++| LangChain Map-Reduce / LlamaIndex CompactAndRefine | Реализовано нативно | `_map_reduce_answer()`: map-выжимки по блокам (≤6, ≤900 симв.) → synthesize по ~2–4k токенов. Включается автоматически при guard_est > 70% бюджета. Без внешней зависимости от LangChain. |
++| LLMLingua | Не рекомендуется | Требует доп. модель (GPT-2/small llama) в RAM/VRAM поверх qwen+bge — конфликт с 8 ГБ RTX 5060. Роль экстрактивного сжатия выполняет map-проход (бесплатно, на той же модели). |
++
++### Следующие шаги проверки
++1. Перезапустить `python main.py`, задать вопрос про формулу Тейлора.
++2. Ожидаемая цепочка в логе: `переведена в think=False` → `повтор запроса с
++   отключённым thinking` → непустой ответ (~70 ток/с). Если снова пусто —
++   сработает map→synthesize или summary-апгрейд.
++3. Закрепить навсегда (опционально): `ollama.thinking_enabled: false` в config.
+diff --git a/config.yaml b/config.yaml
+index af76707..78c883b 100644
+--- a/config.yaml
++++ b/config.yaml
+@@ -10,11 +10,12 @@ storage:
+ ollama:
+   base_url: "http://127.0.0.1:11434"
+   # FIX (модель на машине): в C:\Users\Woodpecker_Prime\.ollama\models лежит
+-  # Qwen3.5-9B-Q4_K_M (~5.5 ГБ весов) — укажите здесь её точное имя из
+-  # `ollama list` (например "qwen3.5:9b" или "Qwen3.5-9B-Q4_K_M:latest").
+-  # Движок подбирает tag по префиксу имени (_resolve_model), но точное имя
+-  # надёжнее. Значение ниже — безопасный дефолт для слабых машин.
+-  chat_model: "qwen3:4b"
++  # Qwen3.5-9B-Q4_K_M (~5.5 ГБ весов) — указан её тег qwen3.5:9b (движок и так
++  # подбирает tag по префиксу через _resolve_model, но точное имя надёжнее).
++  # ВАЖНО: лог 15:12 показывает, что Ollama принимает запрос 'qwen3.5:4b' без
++  # 404 — значит под этим именем реально зарегистрирована НЕ 4b-модель либо
++  # создан алиас. Проверьте `ollama list` и при необходимости скорректируйте.
++  chat_model: "qwen3.5:9b"
+   embedding_model: "bge-m3"
+   # FIX (логи 14:32/14:55, «Ollama вернула ПУСТОЙ ответ; done_reason='length',
+   # eval_count=None»): Qwen3/QwQ по умолчанию «думают» в скрытом поле thinking,
+diff --git a/src/llm/llm_engine.py b/src/llm/llm_engine.py
+index d805bf8..5b198f3 100644
+--- a/src/llm/llm_engine.py
++++ b/src/llm/llm_engine.py
+@@ -108,6 +108,9 @@ class LLMEngine:
+         # Повторные «немые» length-обрывы с одинаковым запросом бесполезны —
+         # считаем их один раз за процесс и подсказываем про think=False.
+         self._think_hint_shown = False
++        # FIX (лог 15:12): рантайм-переключатель think=False после зафиксированного
++        # «немого» length-обрыва (eval_count=None). Ставится из _post_chat.
++        self._force_think_off = False
+         # FIX (логи 00:56/10:48): динамический бюджет генерации, согласованный
+         # с _trim_history (_fit в chat()). Раньше trim резервировал 1024, а
+         # options аллоцировали до 4096 — инвариант prompt+predict<=num_ctx
+@@ -668,10 +671,18 @@ class LLMEngine:
+         reasoning-токены не попадают в content, и при большом промпте модель
+         уходит в length-обрыв с ПУСТЫМ ответом (логи 14:55/14:32). Отключение
+         thinking — единственный честный ремонт таких «немых» пустот.
+-        Ручной override: config.thinking_enabled / env OLLAMA_THINKING."""
++        Ручной override: config.thinking_enabled / env OLLAMA_THINKING.
++
++        FIX (лог 15:12): если движок уже зафиксировал «немой» length-обрыв с
++        eval_count=None (признак съеденного reasoning-бюджета), мы принудительно
++        переключаемся в think=False независимо от имени модели — это спасает
++        кастомные GGUF вроде «Qwen3.5-9B-Q4_K_M», чьё имя может не совпасть с
++        регуляркой, и старые сборки Ollama, где автодетект не срабатывает."""
+         if self._thinking_override is not None:
+             # override=True означает «thinking нужен» — think не отключаем.
+             return False
++        if getattr(self, "_force_think_off", False):
++            return True
+         return bool(_THINKING_MODEL_RE.search(model or ""))
+ 
+     def _chat_body(self, model: str, messages: List[Dict[str, Any]],
+@@ -712,27 +723,38 @@ class LLMEngine:
+             self._pending_gpu_check = False
+             self._report_gen_speed(data)
+         if done_reason == "length":
++            # AUDIT: разные сборки Ollama кладут метрики то в data["metrics"],
++            # то прямо в корень ответа (eval_count/eval_duration). Читаем оба.
++            metrics = data.get("metrics") or data
++            eval_count = metrics.get("eval_count")
+             logger.warning(
+                 "Генерация прервана по лимиту length "
+-                f"(eval_count={data.get('metrics', {}).get('eval_count')}, "
++                f"(eval_count={eval_count}, "
+                 f"num_ctx={options['num_ctx']}, "
+                 f"num_predict={options['num_predict']}).")
+-            # FIX (логи 14:32/14:55): «немой» length-обрыв с eval_count=None у
+-            # Qwen3-подобных моделей — это почти всегда режим thinking: все
+-            # токены ушли в скрытое поле reasoning. Если think=False ещё не
+-            # применялся (override включал thinking / имя модели не распознано),
+-            # подсказываем точную починку и больше не повторяем подсказку.
++            # FIX (логи 14:32/14:55/15:12): «немой» length-обрыв с eval_count=None
++            # у Qwen3-подобных моделей — это почти всегда режим thinking: все
++            # токены ушли в скрытое поле reasoning. Раньше движок только
++            # ПОДСКАЗЫВАЛ пользователю про think=False и продолжал слать тот же
++            # обречённый запрос (лог 15:12: повторные каскады тоже вернули
++            # пустоту — think так и не был применён). Теперь движок сам
++            # принудительно переключается в think=False и сигнализирует
++            # вызывающему коду специальным done_reason='retry_think_off',
++            # чтобы тот тут же повторил генерацию без потери попытки.
+             try:
+-                if (not content.strip() and data.get("metrics", {})
+-                        .get("eval_count") is None
+-                        and not getattr(self, "_think_hint_shown", False)
++                if (not content.strip() and eval_count is None
+                         and not self._thinking_off(model)):
+-                    self._think_hint_shown = True
+-                    logger.warning(
+-                        "LLM: пустой вывод при полном бюджете похож на режим "
+-                        "thinking (Qwen3/QwQ). Отключите reasoning: добавьте в "
+-                        "config.yaml ollama.thinking_enabled: false или "
+-                        "env OLLAMA_THINKING=0.")
++                    self._force_think_off = True
++                    if not getattr(self, "_think_hint_shown", False):
++                        self._think_hint_shown = True
++                        logger.warning(
++                            "LLM: пустой вывод при полном бюджете похож на "
++                            "режим thinking (Qwen3/QwQ/кастомные GGUF). "
++                            "Модель принудительно переведена в think=False; "
++                            "закрепить навсегда: config.yaml "
++                            "ollama.thinking_enabled: false или env "
++                            "OLLAMA_THINKING=0.")
++                    return content, "retry_think_off"
+             except Exception:  # noqa: BLE001 — диагностика не роняет чат
+                 pass
+         if not content.strip():
+@@ -1042,6 +1064,16 @@ class LLMEngine:
+         try:
+             for attempt in range(MAX_CONTINUATIONS + 1):
+                 content, done_reason = self._post_chat(model, cont_messages, options)
++                # FIX (лог 15:12): «немой» length-обрыв с eval_count=None — движок
++                # в _post_chat уже переключил модель в think=False и вернул
++                # sentinel done_reason='retry_think_off'. Повторяем ТОТ ЖЕ запрос
++                # без потери попытки авто-продолжения: теперь reasoning-токены не
++                # съедают бюджет num_predict и content генерируется реально.
++                if done_reason == "retry_think_off":
++                    logger.info(
++                        "LLM: повтор запроса с отключённым thinking "
++                        "(think=False) — reasoning больше не блокирует вывод.")
++                    continue
+                 # AUDIT (диагностика «немой» генерации): eval_count=None при
+                 # done_reason='length' означает, что llama.cpp НЕ ОТРЕНДЕРИЛ ни
+                 # одного токена — запрос физически не влезал в KV-кэш модели.
+diff --git a/src/llm/rag_pipeline.py b/src/llm/rag_pipeline.py
+index e8aa42f..b64ff78 100644
+--- a/src/llm/rag_pipeline.py
++++ b/src/llm/rag_pipeline.py
+@@ -900,6 +900,28 @@ class RAGPipeline:
+         if (answer or "").strip():
+             return answer
+ 
++        # FIX (лог 15:12): до слепого повтора того же обречённого запроса —
++        # попытка с ПРИНУДИТЕЛЬНЫМ отключением reasoning (think=False). Если
++        # модель «Qwen3.5-9B»/QwQ съела весь бюджет num_predict скрытыми
++        # thinking-токенами (done_reason='length', eval_count=None, content=''),
++        # именно этот шаг даёт ей шанс ответить по существу. Хранит переключатель
++        # движок (_force_think_off), мы лишь страхуемся явным option'ом.
++        try:
++            forced = [dict(m) for m in messages]
++            opts_backup = getattr(self.llm, "_thinking_override", None)
++            self.llm._thinking_override = False  # think=False для этого запроса
++            try:
++                logger.warning(
++                    "RAG: пустой ответ модели — перезапрос с think=False "
++                    "(отключён скрытый reasoning, съедающий бюджет генерации)")
++                answer = self.llm.chat(forced)
++            finally:
++                self.llm._thinking_override = opts_backup
++            if (answer or "").strip():
++                return answer
++        except Exception as ex:  # noqa: BLE001 — каскад не роняет конвейер
++            logger.debug(f"RAG: шаг think=False не удался ({ex})")
++
+         logger.warning("RAG: пустой ответ модели — повторяю запрос один раз")
+         answer = self.llm.chat(messages)
+         if (answer or "").strip():

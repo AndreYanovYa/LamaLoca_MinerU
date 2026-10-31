@@ -1,0 +1,110 @@
+app:
+  name: "lama-loca"
+  language: "ru"
+
+storage:
+  root: "data"
+  sqlite_path: "data/storage/library.db"
+  chroma_path: "data/storage/chroma"
+
+ollama:
+  base_url: "http://127.0.0.1:11434"
+  # FIX (модель на машине): в C:\Users\Woodpecker_Prime\.ollama\models лежит
+  # Qwen3.5-9B-Q4_K_M (~5.5 ГБ весов) — указан её тег qwen3.5:9b (движок и так
+  # подбирает tag по префиксу через _resolve_model, но точное имя надёжнее).
+  # ВАЖНО: лог 15:12 показывает, что Ollama принимает запрос 'qwen3.5:4b' без
+  # 404 — значит под этим именем реально зарегистрирована НЕ 4b-модель либо
+  # создан алиас. Проверьте `ollama list` и при необходимости скорректируйте.
+  chat_model: "qwen3.5:9b"
+  embedding_model: "bge-m3"
+  # FIX (логи 14:32/14:55, «Ollama вернула ПУСТОЙ ответ; done_reason='length',
+  # eval_count=None»): Qwen3/QwQ по умолчанию «думают» в скрытом поле thinking,
+  # reasoning-токены съевают бюджет num_predict и content приходит пустым.
+  # Приложение автодетектит такие модели и передаёт think=False — поле можно
+  # оставить закомментированным (авто) или задать явно:
+  #   thinking_enabled: false  — принудительно выключить reasoning для ЛЮБОЙ
+  #       модели (рекомендуется, если пустые ответы повторяются);
+  #   thinking_enabled: true   — оставить thinking (нужен только если модель
+  #       отдаёт reasoning прямо в content).
+  # Аналог без правки конфига: env OLLAMA_THINKING=0.
+  # thinking_enabled: false
+  timeout_seconds: 180
+  # PERF (устранение «очень медленно»): держать модели в VRAM между запросами.
+  # FIX (HTTP 400 'time: missing unit in duration "-1"'): значение -1 («бессрочно»)
+  # многими сборками Ollama не принимается — приложение автоматически подменит
+  # его на безопасные "1h" (модель реально остаётся в VRAM, ошибок нет).
+  # -1 = бессрочно (кодируется в "1h"); N > 0 = секунд ("Ns");
+  # нет поля / -5 = дефолт сервера (5 минут, модель выгружается
+  # и каждый следующий ответ начинается с медленной повторной загрузки весов).
+  keep_alive_seconds: -1
+  gpu_check: true   # предупреждать о CPU-режиме Ollama/torch при старте
+  # AUDIT (пустой ответ при num_ctx 19-23k): «нативное» окно qwen3.5:4b из
+  # GGUF (262144) — архитектурный потолок RoPE, а не рабочий KV-кэш машины.
+  # Потолок токенов ВХОДЯЩЕГО промпта, при котором модель гарантированно
+  # генерирует, а не молча возвращает пустоту. По умолчанию 12000; на
+  # слабой по VRAM/RAM машине снизьте (например, 8000), на мощной — поднимите.
+  # Аналог: env OLLAMA_EFFECTIVE_PROMPT_TOKENS.
+  # FIX (логи 10:48/11:29 «ответ не раскрывает тему»): 0 = АДAPTIVНЫЙ режим —
+  # старт с консервативных 12000 и автоматическое повышение до 20000 после
+  # того как движок подтвердит GPU-инференс метриками живого ответа (~73 ток/с
+  # на RTX 5060). Любое ненулевое значение = ручной потолок (отключает
+  # автоповышение) — например, верните 12000 при нехватке VRAM или поставьте
+  # 20000 сразу, чтобы не ждать подтверждения GPU первым вопросом.
+  effective_prompt_tokens: 0
+  # FIX (конфликт VRAM, лог 16:39): перед запуском MinerU выгружать модели
+  # Ollama из VRAM (POST /api/chat keep_alive=0s), чтобы парсер получил всю
+  # видеопамять и не уходил в CPU-режим ("GPU Memory: 1 GB"). После импорта
+  # qwen/bge перезагрузятся автоматически при первом вопросе/векторизации.
+  # false — отключить (например, если импорт идёт фоном и чат важен сильнее).
+  unload_for_parse: true
+
+search:
+  fts_top_k: 30
+  vector_top_k: 30
+  final_top_k: 16
+
+chunking:
+  target_tokens: 500
+  overlap_tokens: 100
+  min_tokens: 100
+  max_tokens: 800
+  preserve_headings: true
+  preserve_formulas: true
+  preserve_code_blocks: true
+
+external_tools:
+  tesseract_cmd: "C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
+  djvutxt_cmd: "djvutxt"
+  ddjvu_cmd: "ddjvu"
+  ebook_convert_cmd: "ebook-convert"
+
+offline:
+  enabled: true
+# --- Распознавание формул из PDF (Image-to-LaTeX) ---
+# Текстовый слой PDF превращает математику в нечитаемую кашу; pix2tex/texify
+# распознают PNG-зоны формул в LaTeX, который попадает в обучение и RAG.
+# engine: auto | pix2tex | texify | api | off
+formula_ocr:
+  engine: "auto"
+  allow_network_api: false
+
+# --- Движок разбора PDF (MinerU — основной, PyMuPDF+pix2tex — fallback) ---
+# Синхронизировано с config.example.yaml (FIX: раньше секция была только в
+# примере, и реальный конфиг не давал включить режимы MinerU).
+# engine: auto | mineru | pymupdf
+pdf_engine:
+  engine: "auto"
+  languages: "ru,en"     # коды языков; для MinerU-OCR выбирается один (ru→cyrillic)
+  # fast_batch: перед парсингом выгружаются модели Ollama из VRAM
+  # (см. ollama.unload_for_parse), MinerU запускается на GPU и объявляет карте
+  # MINERU_VIRTUAL_VRAM_SIZE = vram_gb_override (или 16 ГБ по умолчанию) —
+  # это поднимает Batch Ratio MinerU с 1 до ~2–8 на RTX 5060 8ГБ.
+  # ВНИМАНИЕ (честная настройка под ваше железо): при слишком большом
+  # «виртуальном» объёме батч не влезает в реальные 8 ГБ → CUDA OOM и тихий
+  # откат в CPU-режим. Для RTX 5060 Laptop (8 ГБ) безопасное значение — 8–9.
+  fast_batch: true
+  # FIX (уточнение к комментарию выше): для MinerU-парсинга на RTX 5060 Laptop
+  # безопасный «виртуальный» объём VRAM — реальные 8 ГБ (батч гарантированно
+  # влезает; ratio поднимается с 1 до ~2–4). Ставьте 16 только если видите в
+  # логе CUDA OOM/тихий откат на CPU — наоборот, это его причина.
+  vram_gb_override: 8    # явный «виртуальный» объём VRAM для Batch Ratio (0 = авто: 16)

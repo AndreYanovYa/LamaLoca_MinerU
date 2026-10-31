@@ -9,8 +9,25 @@ storage:
 
 ollama:
   base_url: "http://127.0.0.1:11434"
-  chat_model: "qwen3.5:4b"
+  # FIX (модель на машине): в C:\Users\Woodpecker_Prime\.ollama\models лежит
+  # Qwen3.5-9B-Q4_K_M (~5.5 ГБ весов) — указан её тег qwen3.5:9b (движок и так
+  # подбирает tag по префиксу через _resolve_model, но точное имя надёжнее).
+  # ВАЖНО: лог 15:12 показывает, что Ollama принимает запрос 'qwen3.5:4b' без
+  # 404 — значит под этим именем реально зарегистрирована НЕ 4b-модель либо
+  # создан алиас. Проверьте `ollama list` и при необходимости скорректируйте.
+  chat_model: "qwen3.5:9b"
   embedding_model: "bge-m3"
+  # FIX (логи 14:32/14:55, «Ollama вернула ПУСТОЙ ответ; done_reason='length',
+  # eval_count=None»): Qwen3/QwQ по умолчанию «думают» в скрытом поле thinking,
+  # reasoning-токены съевают бюджет num_predict и content приходит пустым.
+  # Приложение автодетектит такие модели и передаёт think=False — поле можно
+  # оставить закомментированным (авто) или задать явно:
+  #   thinking_enabled: false  — принудительно выключить reasoning для ЛЮБОЙ
+  #       модели (рекомендуется, если пустые ответы повторяются);
+  #   thinking_enabled: true   — оставить thinking (нужен только если модель
+  #       отдаёт reasoning прямо в content).
+  # Аналог без правки конфига: env OLLAMA_THINKING=0.
+  # thinking_enabled: false
   timeout_seconds: 180
   # PERF (устранение «очень медленно»): держать модели в VRAM между запросами.
   # FIX (HTTP 400 'time: missing unit in duration "-1"'): значение -1 («бессрочно»)
@@ -70,3 +87,30 @@ offline:
 formula_ocr:
   engine: "auto"
   allow_network_api: false
+
+# --- Движок разбора PDF (MinerU — основной, PyMuPDF+pix2tex — fallback) ---
+# Синхронизировано с config.example.yaml (FIX: раньше секция была только в
+# примере, и реальный конфиг не давал включить режимы MinerU).
+# engine: auto | mineru | pymupdf | pix2text
+pdf_engine:
+  engine: "auto"
+  # pix2text (запрос 2026-10-30): если MinerU оставляет «сырую» инлайн-математику
+  # в прозе (P n^(k)(x 0) = f^(k)(x 0) без $..$), поставьте engine: "pix2text" —
+  # движок Pix2Text с собственным MFD оборачивает формулы прямо в тексте страниц.
+  # Требуется: pip install "pix2text[all]" (модели скачаются при 1-м импорте PDF;
+  # CUDA подхватится автоматически). Без пакета — автооткат к "auto".
+  # ВАЖНО: после смены движка книги нужно ПЕРЕИМПОРТИРОВАТЬ (индекс перестраивается).
+  languages: "ru,en"     # коды языков; для MinerU-OCR выбирается один (ru→cyrillic)
+  # fast_batch: перед парсингом выгружаются модели Ollama из VRAM
+  # (см. ollama.unload_for_parse), MinerU запускается на GPU и объявляет карте
+  # MINERU_VIRTUAL_VRAM_SIZE = vram_gb_override (или 16 ГБ по умолчанию) —
+  # это поднимает Batch Ratio MinerU с 1 до ~2–8 на RTX 5060 8ГБ.
+  # ВНИМАНИЕ (честная настройка под ваше железо): при слишком большом
+  # «виртуальном» объёме батч не влезает в реальные 8 ГБ → CUDA OOM и тихий
+  # откат в CPU-режим. Для RTX 5060 Laptop (8 ГБ) безопасное значение — 8–9.
+  fast_batch: true
+  # FIX (уточнение к комментарию выше): для MinerU-парсинга на RTX 5060 Laptop
+  # безопасный «виртуальный» объём VRAM — реальные 8 ГБ (батч гарантированно
+  # влезает; ratio поднимается с 1 до ~2–4). Ставьте 16 только если видите в
+  # логе CUDA OOM/тихий откат на CPU — наоборот, это его причина.
+  vram_gb_override: 8    # явный «виртуальный» объём VRAM для Batch Ratio (0 = авто: 16)

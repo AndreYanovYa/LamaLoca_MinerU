@@ -81,7 +81,7 @@ def _render_formula_png(latex: str, out_path: Path) -> bool:
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         from matplotlib.font_manager import findfont, FontProperties
-        from matplotlib.ft2font import FT2Font, LOAD_NO_HINTING
+        from matplotlib.ft2font import FT2Font
     except ImportError:
         return False
     try:
@@ -530,15 +530,14 @@ class AnswerExporter:
         # пробрасываются с настоящим текстом.
         backend = None
         fpdf_err = None
-        try:
-            import fpdf  # noqa: F401
+        # AUDIT (чистка кода): проверка наличия PDF-бэкендов через
+        # importlib.util.find_spec — без «голых» импортов-заглушек и без
+        # побочных эффектов загрузки тяжёлых библиотек.
+        import importlib.util
+        if importlib.util.find_spec("fpdf") is not None:
             backend = "fpdf2"
-        except ImportError:
-            try:
-                import reportlab  # noqa: F401
-                backend = "reportlab"
-            except ImportError:
-                backend = None
+        elif importlib.util.find_spec("reportlab") is not None:
+            backend = "reportlab"
 
         if backend is None:
             raise RuntimeError(
@@ -562,9 +561,7 @@ class AnswerExporter:
                 logger.warning(f"fpdf2-рендер не удался ({ex}); "
                                "фолбэк на reportlab")
                 fpdf_err = ex
-                try:
-                    import reportlab  # noqa: F401
-                except ImportError:
+                if importlib.util.find_spec("reportlab") is None:
                     raise RuntimeError(
                         f"Ошибка генерации PDF через fpdf2: {fpdf_err}. "
                         "Фолбэк reportlab недоступен (не установлен)."
@@ -987,10 +984,8 @@ class AnswerExporter:
             # Инлайн-стример: multi_cell НЕ используется для строк с $ —
             # только пословный write() + image() в текущей позиции.
             nonlocal eq_idx
-            has_formula = False
             for kind, seg in _tokenize_line(plain):
                 if kind == "formula":
-                    has_formula = True
                     eq_idx += 1
                     emit_formula_image(seg, tmp_dir, eq_idx)
                 else:

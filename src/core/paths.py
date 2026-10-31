@@ -1,5 +1,4 @@
 # src/core/paths.py
-import os
 from pathlib import Path
 from platformdirs import user_cache_dir
 

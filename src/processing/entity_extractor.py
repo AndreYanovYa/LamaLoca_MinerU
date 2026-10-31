@@ -175,7 +175,6 @@ def build_relations(
             last_formal = (bid, et)
 
         # Транзитивные ссылки на другие сущности.
-        own_num = (numbers.get(bid) or "").rstrip(".")
         for ref_type, ref_num in extract_references(text):
             target = by_key.get((ref_type, ref_num))
             if target and target != bid:

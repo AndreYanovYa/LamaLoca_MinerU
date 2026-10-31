@@ -1,0 +1,278 @@
+From 8027426dafd3f60e170437e2856ab2856fdda759 Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Fri, 30 Oct 2026 20:56:14 +0000
+Subject: [PATCH] =?UTF-8?q?InlineMathNormalizer:=20=D0=BF=D0=BE=D1=82?=
+ =?UTF-8?q?=D0=B5=D1=80=D1=8F=D0=BD=D0=BD=D1=8B=D0=B5=20=D0=B8=D0=BD=D0=B4?=
+ =?UTF-8?q?=D0=B5=D0=BA=D1=81=D1=8B=20=D0=B2=20=D0=BF=D1=80=D0=BE=D0=B7?=
+ =?UTF-8?q?=D0=B5=20(=D0=BB=D0=BE=D0=B3=D0=B8=2020:43/21:10:=20'x=200',=20?=
+ =?UTF-8?q?'P=20n(x)'=20=D0=BD=D0=B5=20=D0=BE=D0=B1=D0=BE=D1=80=D0=B0?=
+ =?UTF-8?q?=D1=87=D0=B8=D0=B2=D0=B0=D0=BB=D0=B8=D1=81=D1=8C=20=E2=80=94=20?=
+ =?UTF-8?q?has=5Flost=5Fidx=20=D1=81=20=D0=BA=D0=BE=D0=BD=D1=82=D0=B5?=
+ =?UTF-8?q?=D0=BA=D1=81=D1=82=D0=BD=D1=8B=D0=BC=D0=B8=20=D0=BF=D1=80=D0=BE?=
+ =?UTF-8?q?=D0=B2=D0=B5=D1=80=D0=BA=D0=B0=D0=BC=D0=B8=20left/right;=20=5Fn?=
+ =?UTF-8?q?ormalize=5Fcandidate=20=D0=BF=D1=80=D0=B8=D0=BD=D0=B8=D0=BC?=
+ =?UTF-8?q?=D0=B0=D0=B5=D1=82=20=D0=BE=D0=BA=D1=80=D1=83=D0=B6=D0=B5=D0=BD?=
+ =?UTF-8?q?=D0=B8=D0=B5),=20=D1=81=D0=BB=D1=83=D0=B6=D0=B5=D0=B1=D0=BD?=
+ =?UTF-8?q?=D1=8B=D0=B5=20TeX-=D0=BC=D0=B0=D0=BA=D1=80=D0=BE=D1=81=D1=8B?=
+ =?UTF-8?q?=20=D1=81=D0=BD=D0=B8=D0=BC=D0=B0=D1=8E=D1=82=D1=81=D1=8F=20?=
+ =?UTF-8?q?=D0=B2=D0=BC=D0=B5=D1=81=D1=82=D0=B5=20=D1=81=20=D0=B0=D1=80?=
+ =?UTF-8?q?=D0=B3=D1=83=D0=BC=D0=B5=D0=BD=D1=82=D0=B0=D0=BC=D0=B8=20(\gdef?=
+ =?UTF-8?q?\foo{1}=20->=20'',=20=D1=80=D0=B0=D0=BD=D1=8C=D1=88=D0=B5=20?=
+ =?UTF-8?q?=D0=BE=D1=81=D1=82=D0=B0=D0=B2=D0=BB=D1=8F=D0=BB=20=D0=BC=D1=83?=
+ =?UTF-8?q?=D1=81=D0=BE=D1=80=20'\foo{1}'=20->=20Parser=20Error)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ .../__pycache__/text_cleaner.cpython-312.pyc  | Bin 51925 -> 53500 bytes
+ src/processing/text_cleaner.py                |  67 ++++++++++++++----
+ 2 files changed, 52 insertions(+), 15 deletions(-)
+
+diff --git a/src/processing/__pycache__/text_cleaner.cpython-312.pyc b/src/processing/__pycache__/text_cleaner.cpython-312.pyc
+index 50970ed0f4fe7c7e5d84306d8b108ce1c59953f8..10d5e2f32879f0bbc4a78756b643967c6f455669 100644
+GIT binary patch
+delta 5294
+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
+RBVTfQ6R9zT27gf{{V#*{9svLV
+
+delta 3957
+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
+RmR%Q&SEMpdpSZkA{x8Rq+!Fu*
+
+diff --git a/src/processing/text_cleaner.py b/src/processing/text_cleaner.py
+index 342e459..b086585 100644
+--- a/src/processing/text_cleaner.py
++++ b/src/processing/text_cleaner.py
+@@ -428,12 +428,16 @@ def fix_llm_math_artifacts(text: str) -> str:
+         # FIX (лог 23:xx, «Parser Error: Undefined control sequence: \gdef»):
+         # LLM иногда вставляет служебные TeX-макросы (\gdef, \edef, \def,
+         # \newcommand…) прямо в инлайн-прозу — KaTeX их не определяет и роняет
+-        # весь рендер. Вне $$-блоков они всегда артефакт: снимаем бэкслэш,
+-        # оставляя читаемый текст («\gdef P_n(x)» → «gdef P_n(x)»). Внутри
+-        # $$-блоков макросы легальны — сегменты-формулы пропущены выше.
++        # весь рендер. Вне $$-блоков они всегда артефакт: СНИМАЕМ ВМЕСТЕ С
++        # АРГУМЕНТАМИ («\gdef\foo{1} …» → «…» — раньше оставался мусор
++        # «\foo{1}», который снова валил парсер). Внутри $$-блоков макросы
++        # легальны — сегменты-формулы пропущены выше.
+         seg = re.sub(
+-            r"\\(?:gdef|edef|xdef|def\b|newcommand\b|renewcommand\b|"
+-            r"providecommand\b|let\b|longdef|global\b)(?![A-Za-z])", "", seg)
++            r"\\(?:gdef|edef|xdef|global|longdef)\s*"
++            r"(?:\\[A-Za-z]+\s*)?(?:\{[^{}]*\})?", "", seg)
++        seg = re.sub(
++            r"\\(?:def|newcommand|renewcommand|providecommand|let)\b\s*"
++            r"(?:\\[A-Za-z]+|[A-Za-z])\s*(?:\[[0-9]\])?\s*\{[^{}]*\}", "", seg)
+         parts[i] = seg
+     return "".join(parts)
+ 
+@@ -659,22 +663,48 @@ class InlineMathNormalizer:
+         self._cache[expr] = ok
+         return ok
+ 
++    #: прозаические слова-функции (не математика даже с цифрой-аргументом:
++    #: «n 1 -го порядка», «f 2(x)» — только если это не однобуквенная переменная)
++    _PROSE_WORDS = re.compile(
++        r"^(?:[a-zA-Z]{2,})$")
++
+     # ---------------- нормализация кандидата ----------------
+-    def _normalize_candidate(self, cand: str) -> Optional[str]:
++    def _normalize_candidate(self, cand: str, left: str = "",
++                             right: str = "") -> Optional[str]:
+         s = cand.strip().strip(".,;:")
+         if not s:
+             return None
+         has_script = bool(re.search(r"[\^_]", s))
+         has_op = bool(re.search(r"[=<>\u2248\u2264\u2265\u2260]", s))
+         has_o = bool(re.search(r"(^|[\s(/+\-])[oO]\s*\(", s))
+-        if not (has_script or has_op or has_o):
++        # потерянный индекс/степень в тексте PDF: одиночная переменная + пробел
++        # + цифра («x 0», «P n(x)») — маркер математики. Слева обязан быть
++        # конец слова прозы (пробел; перед ним не цифра, чтобы «… 2025 x 0»
++        # не склеивалось). Справа — конец выражения: разделитель ИЛИ пробел +
++        # строчная кириллица (проза Кудрявцева: «… x 0 , то …», «к x 0
++        # остаточный …», «многочлен P n(x) степени …»). ЗАПРЕЩЁН хвост с
++        # заглавной буквы — это начало нового предложения («f^(k)(x 0). Это
++        # равенство…» остаётся сырым, но безопасным). Числительные («n -ю»)
++        # отсекаются: за цифрой идёт дефис/буква — не математический хвост.
++        _RIGHT_END = r"(?=$|[ \t]*(?:[.,;:!?)\]]|[а-яё]))"
++        has_lost_idx = bool(
++            (re.fullmatch(r"[A-Za-z][ \t]+[0-9]{1,3}", s)
++             or re.fullmatch(r"[A-Za-z][ \t]+[A-Za-z]\([A-Za-z0-9 \t]+\)", s))
++            and re.search(r"[ \t]$", left) is not None
++            and not re.search(r"[0-9][ \t]$", left)
++            and (re.match(_RIGHT_END, right) is not None
++                 or right.strip() == "")   # конец строки без знаков — тоже ок
++        )
++        if not (has_script or has_op or has_o or has_lost_idx):
+             return None
+         # потерянные индексы (цифровой токен): буква/скобка + пробел + цифра →
+-        # «x_0», «r_n» — только если за токеном конец прогона или разделитель
+-        # («, ; ) (= < > ≈ ≤ ≥ ≠»). Раньше склейка шла по всему прогону:
+-        # «r n(x) = O(...)» превращалось в «r_{n}(x)» (индекс стал аргументом —
+-        # подмена смысла), а «P n^(k)(x 0) = f^(k)(x 0)» терял скобки у ^{(k)}.
+-        s = re.sub(r"(?<=[A-Za-z0-9)\]])[ \t]+(?=\d{1,4}(?![A-Za-z0-9])(?=$|[ \t,;)=<>≈≤≥≠]))",
++        # «x_0», «r_n». Условие конца: конец прогона, разделитель ИЛИ строчная
++        # кириллица (в прозе «… x 0 , то существует …» после запятой идёт
++        # русское слово — раньше негативный lookahead его не пропускал и
++        # индекс терялся). Буквенный индекс («P n(x)») склеивается только если
++        # за ним явный скрипт/аргумент либо весь кандидат — паттерн
++        # «переменная + индекс» (has_lost_idx выше).
++        s = re.sub(r"(?<=[A-Za-z0-9)\]])[ \t]+(?=\d{1,4}(?![A-Za-z0-9])(?=$|[ \t,;)=<>≈≤≥≠]|[А-Яа-яЁё]))",
+                    "_", s)
+         # потерянные скрипты с явным маркером: «^ (k)» → '^{(k)}', '_ {0}' и т.п.
+         s = re.sub(r"([\^_])[ \t]+(?=[({])", r"\1", s)
+@@ -687,6 +717,12 @@ class InlineMathNormalizer:
+             if new == s:
+                 break
+             s = new
++        # одиночная переменная + буквенный индекс с аргументом («P n(x)» →
++        # «P_n(x)») — только когда кандидат ВЕСЬ является таким паттерном
++        # (has_lost_idx); иначе «не выше n ,»/«f имеет n -ю» не трогаем.
++        if has_lost_idx and re.fullmatch(r"[A-Za-z]_[A-Za-z]\([A-Za-z0-9]+\)",
++                                         s.replace(" ", "")):
++            s = re.sub(r"([A-Za-z])[ \t]+([A-Za-z])(?=\()", r"\1_\2", s)
+         # «o (…)», «O (…)» — o-нотация: TeX-команда с пробелом («\o »),
+         # KaTeX-совместимо; голые «o(x)»/«O(x^n+1)» без пробела тоже легальны,
+         # но нормализуем к единому виду только при явном пробеле.
+@@ -748,9 +784,10 @@ class InlineMathNormalizer:
+         text = re.sub(r"(?<!\\)\$[^$\n]+?\$", _save, text)
+         text = re.sub(r"`[^`\n]+?`", _save, text)
+ 
+-        def _repl(m: re.Match) -> str:
++        def _repl(m: re.Match, line: str) -> str:
+             raw = m.group(0)
+-            cand = self._normalize_candidate(raw)
++            cand = self._normalize_candidate(raw, left=line[:m.start()],
++                                             right=line[m.end():])
+             if cand is None:
+                 return raw
+             if self.validate(cand) is False:
+@@ -765,7 +802,7 @@ class InlineMathNormalizer:
+             if line.strip().startswith("$$") or "```" in line:
+                 out_lines.append(line)
+                 continue
+-            out_lines.append(self._CAND_RE.sub(_repl, line))
++            out_lines.append(self._CAND_RE.sub(lambda mm: _repl(mm, line), line))
+         text = "\n".join(out_lines)
+         return re.sub(r"\x00B(\d+)\x00", lambda m: blocks[int(m.group(1))], text)
+ 
+-- 
+2.39.5
+

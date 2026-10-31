@@ -141,14 +141,178 @@ _INLINE_MATH_MAP = {
     r"\mathbb{Z}": "\u2124",
     r"\mathbb{Q}": "\u211a",
     r"\mathbb{C}": "\u2102",
+    # FIX (лог 23:xx, таблица «арифметических операций»): модель выдаёт в
+    # ячейках голые \frac/\cdot/\neq/\quad — их НЕ было в таблице, и
+    # конвертер оставлял команды как есть («\frac{f(x)}{g(x)}» → «fracf(x)g(x)»).
+    # \cdot/\neq были только в text_cleaner._LATEX_TO_UNICODE, но UI-карта
+    # (_INLINE_MATH_MAP) — отдельная; синхронизируем её с полным набором.
+    r"\cdot": "\u00b7",     # ·
+    r"\times": "\u00d7",    # ×
+    r"\div": "\u00f7",      # ÷
+    r"\pm": "\u00b1",       # ±
+    r"\mp": "\u2213",       # ∓
+    r"\neq": "\u2260",      # ≠
+    r"\le": "\u2264", r"\ge": "\u2265",
+    r"\leqslant": "\u2264", r"\geqslant": "\u2265",
+    r"\equiv": "\u2261",    # ≡
+    r"\sim": "\u223c",      # ∼
+    r"\propto": "\u221d",   # ∝
+    r"\infty": "\u221e",    # ∞
+    r"\sum": "\u2211", r"\prod": "\u220f", r"\int": "\u222b",
+    r"\partial": "\u2202", r"\nabla": "\u2207",
+    r"\forall": "\u2200", r"\exists": "\u2203",
+    r"\emptyset": "\u2205", r"\varnothing": "\u2205",
+    r"\cup": "\u222a", r"\cap": "\u2229", r"\setminus": "\u2216",
+    r"\subseteq": "\u2286", r"\supseteq": "\u2287",
+    r"\subset": "\u2282", r"\supset": "\u2283",
+    r"\in": "\u2208", r"\notin": "\u2209",
+    r"\land": "\u2227", r"\lor": "\u2228", r"\neg": "\u00ac",
+    r"\implies": "\u21d2", r"\iff": "\u21d4",
+    r"\rightarrow": "\u2192", r"\to": "\u2192",
+    r"\leftarrow": "\u2190", r"\Rightarrow": "\u21d2",
+    r"\approx": "\u2248", r"\cong": "\u2245", r"\simeq": "\u2243",
+    r"\perp": "\u22a5", r"\parallel": "\u2225",
+    r"\angle": "\u2220",    # ∠
+    r"\degree": "\u00b0",
+    r"\alpha": "\u03b1", r"\beta": "\u03b2", r"\gamma": "\u03b3", r"\delta": "\u03b4",
+    r"\varepsilon": "\u03b5", r"\epsilon": "\u03b5", r"\zeta": "\u03b6", r"\eta": "\u03b7",
+    r"\theta": "\u03b8", r"\vartheta": "\u03d1", r"\iota": "\u03b9", r"\kappa": "\u03ba",
+    r"\lambda": "\u03bb", r"\mu": "\u03bc", r"\nu": "\u03bd", r"\xi": "\u03be",
+    r"\pi": "\u03c0", r"\varpi": "\u03d6", r"\rho": "\u03c1", r"\varrho": "\u03f1",
+    r"\varsigma": "\u03c2", r"\sigma": "\u03c3", r"\tau": "\u03c4", r"\upsilon": "\u03c5",
+    r"\phi": "\u03c6", r"\varphi": "\u03d5", r"\chi": "\u03c7", r"\psi": "\u03c8",
+    r"\omega": "\u03c9",
+    r"\Gamma": "\u0393", r"\Delta": "\u0394", r"\Theta": "\u0398", r"\Lambda": "\u039b",
+    r"\Xi": "\u039e", r"\Pi": "\u03a0", r"\Sigma": "\u03a3", r"\Upsilon": "\u03a5",
+    r"\Phi": "\u03a6", r"\Psi": "\u03a8", r"\Omega": "\u03a9",
+    r"\ldots": "\u2026", r"\cdots": "\u2026", r"\vdots": "\u22ee",
+    r"\prime": "\u2032",    # ′
+    r"\circ": "\u2218",     # ∘ (композиция f \circ g)
+    r"\bullet": "\u2219",
+    r"\deg": "deg", r"\lim": "lim", r"\max": "max", r"\min": "min",
+    r"\sin": "sin", r"\cos": "cos", r"\tg": "tg", r"\arctg": "arctg",
+    r"\ln": "ln", r"\lg": "lg", r"\log": "log", r"\exp": "exp",
+    r"\operatorname{arc}\,tg": "arctg",
+    r"\colon": ":",
+    r"\backslash": "\\",
+    r"\binom": "",          # снимается ниже вместе со скобками аргументов
 }
 # Команды сортируются по убыванию длины: \notin раньше \in, \subseteq раньше \subset.
 _SORTED_MATH_KEYS = sorted(_INLINE_MATH_MAP, key=len, reverse=True)
+
+# Структурные команды, которые в текстовом (Unicode) выводе должны быть
+# РАЗВЕРНУТЫ, а не «оголены»: иначе «\frac{f(x)}{g(x)}» превращалось в
+# «fracf(x)g(x)», а «\quad» — в слово «quad» (баг из анализа таблицы).
+
+
+def _scan_group(s: str, i: int):
+    """Вернуть (содержимое, индекс после группы), если s[i] открывает группу.
+
+    Поддержка {…} с произвольной вложенностью и (…) с балансировкой; одиночный
+    символ (\\frac a b, \\sqrt x) — как группа из одного символа. Иначе None.
+    """
+    if i >= len(s):
+        return None
+    ch = s[i]
+    if ch == "{":
+        depth = 0
+        for j in range(i, len(s)):
+            if s[j] == "{":
+                depth += 1
+            elif s[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    return s[i + 1:j], j + 1
+        return None  # незакрытая скобка — не трогать
+    if ch == "(":
+        depth = 0
+        for j in range(i, len(s)):
+            if s[j] == "(":
+                depth += 1
+            elif s[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    return s[i + 1:j], j + 1
+        return None
+    if not ch.isspace():
+        return ch, i + 1
+    return None
+
+
+def _read_args(s: str, i: int, n: int):
+    """Пропустив пробелы, считать n групп подряд. None, если не читается."""
+    args = []
+    while len(args) < n:
+        while i < len(s) and s[i].isspace():
+            i += 1
+        g = _scan_group(s, i)
+        if g is None:
+            return None
+        args.append(g[0])
+        i = g[1]
+    return args, i
+
+
+def _expand_structural(s: str) -> str:
+    """Развернуть структурные LaTeX-команды в читаемый текст.
+
+    Работает по одному совпадению за проход (левое самое длинное имя) и
+    вызывает себя рекурсивно на аргументах — поэтому корректно обрабатывается
+    любая вложенность: \\frac{\\frac{a}{b}}{c}, \\frac{f^{(k)}(x_0)}{k!}.
+      \\frac/\\dfrac/\\tfrac{x}{y} -> (x)/(y)
+      \\binom{n}{k}               -> C(n, k)
+      \\sqrt{x} / \\sqrt[n]{x}     -> sqrt(x) / root(n)(x)
+    Пробельные (\\quad, \\,) и \\left/\\right снимаются целиком.
+    Незаконченные конструкции остаются без изменений (безопасный фолбэк).
+    """
+    changed = True
+    while changed:
+        changed = False
+        m = re.search(r"\\(?:d?t?frac|binom|sqrt|quad|qquad|left|right)\b", s)
+        if not m:
+            break
+        cmd, i = m.group(0)[1:], m.end()
+        if cmd in ("quad", "qquad"):
+            s = s[:m.start()] + " " + s[i:]
+        elif cmd in ("left", "right"):
+            s = s[:m.start()] + s[i:]
+        else:
+            nargs = 2 if cmd in ("frac", "dfrac", "tfrac", "binom") else 1
+            opt = None
+            if cmd == "sqrt" and i < len(s) and s[i] == "[":
+                j = s.find("]", i)
+                if j != -1:
+                    opt, i = s[i + 1:j], j + 1
+            rd = _read_args(s, i, nargs)
+            if rd is None:
+                break  # обрывок — оставляем как есть
+            args, end = rd
+            args = [(_expand_structural(a) or a).strip() for a in args]
+            if cmd == "sqrt" and opt is not None:
+                rep = "root(%s)(%s)" % (opt.strip(), args[0])
+            elif cmd == "sqrt":
+                rep = "sqrt(%s)" % args[0]
+            elif cmd == "binom":
+                rep = "C(%s, %s)" % (args[0], args[1])
+            else:
+                rep = "(%s)/(%s)" % (args[0], args[1])
+            s = s[:m.start()] + rep + s[end:]
+        changed = True
+    return s
 
 
 def _latex_inline_to_unicode(latex: str) -> str:
     """LaTeX-тело инлайн-формулы → юникод-текст (\\exists → ∃, \\in → ∈…)."""
     s = latex.strip()
+    # FIX (таблица «арифметических операций», лог 23:xx): структурные дроби
+    # разворачиваются ПЕРВЫМИ — до общего цикла замен и до снятия бэкслэшей.
+    # Иначе «\frac{f(x)}{g(x)}» превращалось в «fracf(x)g(x)» (голый код без
+    # слэша), а не в читаемое «(f(x))/(g(x))». Вложенные аргументы
+    # (\frac{f^{(k)}(x_0)}{k!}) сохраняют фигурные скобки до их снятия на
+    # позднем шаге — старый regex [^{}]* резал такие формулы пополам.
+    s = _expand_structural(s)
+    # Пробельные/служебные команды → пробел (иначе «\quad x» → «quad x»)
+    s = re.sub(r"\\(?:,|:|;|\>|\.|\!| )(?![A-Za-z])", " ", s)
     for cmd in _SORTED_MATH_KEYS:
         if cmd in s:
             s = s.replace(cmd, " " + _INLINE_MATH_MAP[cmd] + " ")
@@ -179,7 +343,22 @@ def _latex_inline_to_unicode(latex: str) -> str:
     # одиночные латинские буквы/цифры в формуле ($A$, $x_1$, "$A, B, C$") —
     # обычный текст: убираем служебные скобки LaTeX и склеиваем
     s = re.sub(r"[{}]", "", s)
-    s = s.replace("_", "\u2009")  # нижние индексы: «a_1» → «a₁» читаемо тонким пробелом
+    # FIX (лог 23:xx, «x\u20090» вместо x₀): тонкий пробел вставлялся после
+    # ЛЮБОГО нижнего индекса, включая многосимвольные («x_0», «a_k») —
+    # пользователь видел разорванное «x 0». Теперь одиночный индекс-цифра/
+    # буква сворачивается в настоящий Unicode-подстрочный знак (x_0 → x₀,
+    # a_k → aₖ), составные (_{k=0}) — остаются с тонким пробелом.
+    _SUBCH = {"0": "\u2080", "1": "\u2081", "2": "\u2082", "3": "\u2083",
+              "4": "\u2084", "5": "\u2085", "6": "\u2086", "7": "\u2087",
+              "8": "\u2088", "9": "\u2089", "a": "\u2090", "e": "\u2091",
+              "h": "\u2092", "i": "\u2093", "j": "\u029c", "k": "\u2096",
+              "l": "\u2097", "m": "\u2098", "n": "\u2099", "o": "\u209c",
+              "p": "\u209a", "r": "\u1d63", "s": "\u209b", "t": "\u209c",
+              "u": "\u209f", "v": "\u1d6c", "x": "\u2093"}
+    def _sub(m):
+        return _SUBCH.get(m.group(1).lower(), m.group(1))
+    s = re.sub(r"_([A-Za-z0-9])(?![A-Za-z0-9])", _sub, s)
+    s = s.replace("_", "\u2009")  # остаточные нижние индексы: читаемо
     s = re.sub(r"\s{2,}", " ", s).strip()
     return s
 
@@ -208,6 +387,21 @@ def clean_inline_math(text: str) -> str:
         return "\x00BLK%d\x00" % (len(blocks) - 1)
 
     text = re.sub(r"\$\$(.+?)\$\$", _save_block, text, flags=re.DOTALL)
+
+    # FIX (лог 23:xx, таблица «арифметических операций»): раньше голые команды
+    # оборачивались в $..$ ПО ОДНОЙ регуляркой без аргументов — от
+    # «$\frac{f(x)}{g(x)}$» оставалось «$ fracf(x) {g(x)}$» (мусор вместо
+    # дроби). Теперь структурные конструкции (\frac{}{}, \binom, \sqrt,
+    # \left/\right, \quad) разворачиваются в читаемый текст ПЕРВЫМИ, прямо
+    # в исходной строке; остаточные одиночные команды оборачиваются как прежде.
+    text = _expand_structural(text)
+    # Голые кванторы (\exists x, \forall \epsilon): склеиваем команду с
+    # ОДНИМ следующим токеном в фигурную группу ДО оборачивания — иначе
+    # конвертер режет их по одному слову. Токен может быть и командой
+    # (\delta), поэтому группа строится «команда|слово» целиком.
+    text = re.sub(r"\\(exists|forall|nexists)([ \t]+)(?:\\([A-Za-z]+)|([A-Za-z0-9]+))",
+                  lambda m: "\\" + m.group(1) + "{" + (m.group(3) or m.group(4)) + "}",
+                  text)
     # FIX (лог 12:41–12:46 + скриншот «\mathbf{t}…»): голые LaTeX-команды
     # (в т.ч. с аргументом {..}) в прозе без знаков $ → инлайн-формулы,
     # которые сворачиваются юникод-конвертером ниже. Чистая проза (без

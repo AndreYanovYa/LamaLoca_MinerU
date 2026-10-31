@@ -73,6 +73,17 @@ class OllamaConfig:
     # режим ("GPU Memory: 1 GB"). После импорта модели перезагрузятся сами
     # при первой векторизации/вопросе. false — отключить выгрузку.
     unload_for_parse: bool = True
+    # FIX (логи 14:32/14:55, «Ollama вернула ПУСТОЙ ответ; done_reason=
+    # 'length', eval_count=None»): модели Qwen3/QwQ по умолчанию генерируют
+    # скрытые reasoning-токены (поле thinking), которые не попадают в content
+    # и съевают весь бюджет num_predict -> пустой ответ. Приложение само
+    # передаёт think=False для таких моделей. Значения поля:
+    #   null (нет поля) — автодетект по имени модели (рекомендуется);
+    #   false — принудительно отключить reasoning даже для неизвестных моделей;
+    #   true  — оставить thinking включённым (для chat-шаблонов, где reasoning
+    #         виден в content; на Ollama <0.9 может давать пустые ответы).
+    # Аналог: env OLLAMA_THINKING=0/1.
+    thinking_enabled: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -132,10 +143,14 @@ class PdfEngineConfig:
     PyMuPDF — обычный текстовый экстрактор: сложная/инлайн-математика в нём
     превращается в кашу. MinerU анализирует страницы как картинки (layout +
     формульный детектор/распознаватель) и отдаёт Markdown с валидным LaTeX.
-      engine: auto | mineru | pymupdf
+      engine: auto | mineru | pymupdf | pix2text
         auto   — MinerU как основной, PyMuPDF+pix2tex как fallback (рекомендуется);
         mineru — только MinerU (ошибка импорта = ошибка импорта документа);
         pymupdf — старый пайплайн без MinerU.
+        pix2text — Pix2Text (см. src/ingestion/pix2text_parser.py): собственный
+          конвейер Layout+OCR+MFD/MFR, лучше оборачивает ИНЛАЙН-формулы прямо
+          в прозе ("$P_n^{(k)}(x_0)$"); при недоступности пакета — автооткат
+          к auto. Установка: pip install "pix2text[all]" (torch с CUDA уже есть).
       languages: языки для OCR-ветки MinerU (ru,en по умолчанию).
     """
     engine: str = "auto"
@@ -321,6 +336,11 @@ class Settings:
                 effective_prompt_tokens=int(
                     ollama_raw.get("effective_prompt_tokens", 0)),
                 unload_for_parse=bool(ollama_raw.get("unload_for_parse", True)),
+                # None = автодетект thinking по имени модели; true/false —
+                # ручной override (см. OllamaConfig.thinking_enabled).
+                thinking_enabled=(None if "thinking_enabled" not in ollama_raw
+                                  else bool(ollama_raw.get(
+                                      "thinking_enabled"))),
             ),
             search=SearchConfig(
                 fts_top_k=int(search_raw.get("fts_top_k", 20)),

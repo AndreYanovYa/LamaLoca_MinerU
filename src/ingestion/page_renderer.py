@@ -12,7 +12,7 @@ viewer'а.
 детектора «каши» в pdf_parser, а не на каждой странице.
 """
 from pathlib import Path
-from typing import Iterable, Optional, Tuple
+from typing import Optional, Tuple
 
 from loguru import logger
 

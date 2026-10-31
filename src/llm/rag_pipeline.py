@@ -19,6 +19,7 @@ RAG-пайплайн с навигацией по структуре докум�
    только через pymupdf (раньше для EPUB оглавление было недоступно).
 """
 import json
+import math
 import re
 from collections import defaultdict
 from difflib import SequenceMatcher
@@ -89,6 +90,44 @@ RRF_K = 60
 MAX_HISTORY_TURNS = 4
 
 
+# Ключ-канон для дедупликации: Unicode-глифы «плоской» версии блока ↔ ASCII-токены
+# (совпадают с именами LaTeX-команд после второго прохода _math_key).
+_MATH_CANON = {
+    "\u03b1": "a", "\u03b2": "b", "\u03b3": "g", "\u03b4": "d",
+    "\u03b5": "e", "\u03f5": "e", "\u03b6": "z", "\u03b7": "h",
+    "\u03b8": "th", "\u03bb": "l", "\u03bc": "m", "\u03bd": "n",
+    "\u03be": "x", "\u03c0": "p", "\u03c1": "r", "\u03c3": "s",
+    "\u03c4": "t", "\u03c6": "f", "\u03c8": "ps", "\u03c9": "w",
+    "\u0393": "G", "\u0394": "D", "\u0398": "TH", "\u039b": "L",
+    "\u03a0": "P", "\u03a3": "S", "\u03a6": "F", "\u03a8": "PS", "\u03a9": "W",
+    "\u2208": "in", "\u2209": "notin", "\u2203": "ex", "\u2200": "all",
+    "\u2204": "nex", "\u2205": "emp", "\u2282": "sub", "\u2286": "sube",
+    "\u2283": "sup", "\u2287": "supe", "\u222a": "cup", "\u2229": "cap",
+    "\u2216": "setmn", "\u2264": "le", "\u2265": "ge", "\u2260": "ne",
+    "\u2248": "ap", "\u2261": "equiv", "\u2192": "to", "\u21d2": "imp",
+    "\u21d4": "iff", "\u221e": "inf", "\u2211": "sum", "\u220f": "prod",
+    "\u222b": "int", "\u2202": "partial", "\u2207": "nabla", "\u00b7": "dot",
+    "\u00d7": "times", "\u00f7": "div", "\u00b1": "pm",
+}
+# подстрочные/надстрочные цифры и буквы индексов → обычные (x₀ == x_0)
+_SUBSUP_TRANS = str.maketrans({
+    "₀": "0", "₁": "1", "₂": "2", "₃": "3", "₄": "4", "₅": "5",
+    "₆": "6", "₇": "7", "₈": "8", "₉": "9", "ₙ": "n", "ₖ": "k",
+    "ₘ": "m", "ₓ": "x", "ᵢ": "i", "ⱼ": "j", "ₚ": "p", "ᵣ": "r",
+    "ₛ": "s", "ₜ": "t", "ᵤ": "u", "ᵥ": "v",
+})
+# имена LaTeX-команд → те же ASCII-токены, что даёт глиф-канал _MATH_CANON
+_MATH_NAME_MAP = {
+    "alpha": "a", "beta": "b", "gamma": "g", "delta": "d",
+    "varepsilon": "e", "epsilon": "e", "theta": "th", "lambda": "l",
+    "mu": "m", "nu": "n", "pi": "p", "sigma": "s", "phi": "f",
+    "omega": "w", "infty": "inf", "forall": "all", "exists": "ex",
+    "emptyset": "emp", "varnothing": "emp", "subseteq": "sub",
+    "subset": "sub", "leq": "le", "geq": "ge", "neq": "ne",
+    "approx": "ap", "rightarrow": "to", "cdot": "dot",
+}
+
+
 class RAGPipeline:
     """RAG-пайплайн с навигацией по структуре документа."""
 
@@ -123,6 +162,9 @@ class RAGPipeline:
 
         # Память диалога: список {"question", "answer"} последних обменов.
         self.history: List[Dict[str, str]] = []
+        # Последний вопрос — для релевантностных эвристик префлайта
+        # (_fit_block_to_budget выбирает окно вокруг «вопросного» места).
+        self._last_question: str = ""
 
     # ------------------------------------------------------------------
     # Управление состоянием
@@ -305,7 +347,12 @@ class RAGPipeline:
                 if lang in ("", "md", "markdown"):
                     t = body[nl + 1:].strip()
         from src.llm.prompt_builder import PromptBuilder
-        return PromptBuilder.math_guard(t)
+        t = PromptBuilder.math_guard(t)
+        # FIX (лог ИИ-кодера 15:1x, Тейлор): косметика ответа LLM —
+        # \^ вне $$-блоков, broken bold («** п -ю производную**»),
+        # пустые маркеры списков. Идемпотентно, KaTeX-блоки не трогает.
+        from src.processing.text_cleaner import sanitize_llm_answer
+        return sanitize_llm_answer(t)
 
     @staticmethod
     def _fit_context(text: str, budget: int = 14000) -> str:
@@ -414,7 +461,138 @@ class RAGPipeline:
         # по формулировке вопроса (название главы учтётся в FTS/векторе).
         return self._handle_semantic_request(question)
 
+    # ------------------------------------------------------------------
+    # FIX (логи 14:30, «пайплайн выбрасывает § 13. ФОРМУЛА ТЕЙЛОРА»):
+    # причина выброса — НЕ ChromaDB: она возвращает чанки целиком и лимитов
+    # токенов не имеет. Контекст раздували склейка соседних блоков
+    # (_merge_adjacent_chunks давал 16633 токена на одном блоке), а префлайт
+    # выкидывал блоки с КОНЦА ранжированного списка — pop() не смотрит на
+    # релевантность и сносил как мусор (указатель «Линия уровня…»), так и
+    # нужное («13.1. ВЫВОД ФОРМУЛЫ ТЕЙЛОРА»). Новые методы:
+    #  1) _protect_relevant — релевантные вопросу блоки никогда не удаляются
+    #     первыми; при перегрузе сначала уходят нерелевантные хвосты;
+    #  2) _fit_block_to_budget — если защищённый блок сам больше бюджета, он
+    #     сокращается ОКНОМ вокруг самой релевантной части (с сохранением
+    #     [N]-маркера блока), а не выбрасывается;
+    #  3) _estimate_full_prompt — честная оценка финального промпта (шаблон +
+    #     история + все блоки) для safe-guard'а перед отправкой в LLM.
+    # ------------------------------------------------------------------
+
+    _STOPWORDS = frozenset("""
+        и в во не ни на по об от до же ли как что это эти тот та мы вы мне мне
+        покажи покажи-ка дай напиши ответь расскажи объясни формулу формула
+        the a an of and or to in for with show give tell explain about
+    """.split())
+
+    def _relevance_score(self, question: str, text: str) -> float:
+        """Быстрая lexical-релевантность блока вопросу (0..1).
+
+        Покрываем словами вопроса (без стоп-слов, с морфологическими префиксами
+        по образцу текста) — этого достаточно, чтобы отличить «формула тейлора
+        + доказательство» от указателя или смежных §29. Работает на символах,
+        без эмбеддингов: дёшево и детерминированно."""
+        qw = re.findall(r"[а-яёa-z0-9]{3,}", (question or "").lower())
+        qw = [w for w in qw if w not in self._STOPWORDS]
+        if not qw:
+            return 0.0
+        tl = (text or "").lower()
+        hits = sum(1 for w in qw if w[:5] in tl or w in tl)
+        return hits / len(qw)
+
+    def _fit_block_to_budget(self, chunk: Dict[str, Any],
+                             max_tokens: int) -> Dict[str, Any]:
+        """Сократить ОДИН релевантный блок до max_tokens окном вокруг самой
+        релевантной части вместо полного выброса (корень потери § 13.1)."""
+        text = str(chunk.get("text") or "")
+        try:
+            est = self.llm.estimate_tokens(
+                [{"role": "user", "content": text}])
+        except Exception:  # noqa: BLE001
+            est = None
+        if est is None:
+            est = max(1, len(text) // 4)
+        if est <= max_tokens or not text:
+            return chunk
+        marker = ""
+        mm = re.match(r"\s*(\[\d+\])\s*", text)
+        if mm:
+            marker = mm.group(1) + "\n"
+            body = text[mm.end():]
+        else:
+            body = text
+        # Символьный бюджет окна: conservatively 0.5*max_tokens (метрика
+        # движка для кириллицы ~1 токен/символ; запас укрощает и сам цикл
+        # префлайта, и safeguard — окно гарантированно влезает в бюджет).
+        ratio = max(0.2, min(1.0, max_tokens / est))
+        keep_chars = min(max(800, int(len(body) * ratio * 0.5)),
+                         int(0.5 * max_tokens))
+        if keep_chars >= len(body):
+            return chunk
+        # Центр окна — позиция самого «вопросного» предложения.
+        center = 0
+        best = -1.0
+        sents = re.split(r"(?<=[.!?])\s+", body)
+        pos = 0
+        for s in sents:
+            sc = self._relevance_score(self._last_question or "", s)
+            if sc > best:
+                best, center = sc, pos
+            pos += len(s) + 1
+        half = keep_chars // 2
+        start = max(0, min(center - half, len(body) - keep_chars))
+        snippet = body[start:start + keep_chars]
+        prefix = "…" if start > 0 else ""
+        suffix = "…" if start + keep_chars < len(body) else ""
+        out = dict(chunk)
+        out["text"] = f"{marker}{prefix}{snippet}{suffix}"
+        logger.info(
+            f"RAG: oversized-блок '{body[:40]}…' ужат "
+            f"{est} → ~{max(1, len(out['text']) // 4)} токенов окном вокруг "
+            f"релевантной части (вместо выброса)")
+        return out
+
+    def _protect_relevant(self, chunks: List[Dict[str, Any]],
+                          question: str) -> List[Dict[str, Any]]:
+        """Переупорядочить блоки так, чтобы префлайт-фильтр (pop с конца)
+        сначала снимал наименее релевантное. Порядок внутри групп сохраняется
+        (стабильная сортировка), маркеры [N] не трогаем — источники
+        извлекаются по ним из context_chunks результата."""
+        if not chunks:
+            return chunks
+        scored = [(self._relevance_score(question, c.get("text", "")), i)
+                  for i, c in enumerate(chunks)]
+        order = sorted(range(len(chunks)), key=lambda i: (-scored[i][0], i))
+        return [chunks[i] for i in order]
+
+    def _estimate_full_prompt(self, question: str,
+                              chunks: List[Dict[str, Any]],
+                              *, with_history: bool = False) -> int:
+        """Оценка финального промпта (шаблон + все блоки). Метрика
+        идентична боевой отправке; исключения наружу не выпускаем — метод
+        вызывается в safe-guard'е перед самим собой же.
+
+        FIX (лог 20:43): история диалога по умолчанию НЕ учитывается — её
+        обрезкой до окна модели занимается llm_engine._trim_history; если бы
+        safeguard считал бюджет вместе с историей, он снимал бы релевантные
+        блоки учебника «про запас», хотя движок сам освобождает место под
+        них. with_history=True остаётся для ручных проверок."""
+        try:
+            msgs = self.prompt_builder.build_rag_prompt(
+                question, chunks,
+                history=_to_dicts(self.history) if with_history else None)
+            fit = None
+            try:
+                fit = self.llm.probe_fit(msgs)
+            except Exception:  # noqa: BLE001
+                fit = None
+            if fit is not None:
+                return fit[3]
+            return self.llm.estimate_tokens(msgs)
+        except Exception:  # noqa: BLE001
+            return math.inf
+
     def _handle_semantic_request(self, question: str) -> Dict[str, Any]:
+        self._last_question = question
         query_embedding = self.embedder.embed_texts([question])[0]
         # AUDIT ('str' object has no attribute 'items'): нормализация типа
         # элементов на входе каждого канала — та же гарантия, что в summary-
@@ -436,6 +614,11 @@ class RAGPipeline:
         # Склеиваем соседние куски одного раздела в связные блоки (тот же
         # принцип, что и в summary-ветке): модель читает цельный текст.
         context_chunks = _to_dicts(self._merge_adjacent_chunks(context_chunks))
+
+        # FIX (логи 14:30): до бюджетного фильтра поднимаем релевантные
+        # вопросу блоки вверх списка — префлайт удаляет с конца, и теперь
+        # первыми уходят указатели/мусор, а не § 13.1 «Вывод формулы Тейлора».
+        context_chunks = self._protect_relevant(context_chunks, question)
 
         # FIX (логи 13:01 и 14:16, «немой» пустой ответ при перегрузе):
         # контекст должен влезать в ЭФФЕКТИВНЫЙ бюджет модели ещё ДО отправки.
@@ -478,22 +661,22 @@ class RAGPipeline:
             # «немого» length-обрыва. Адаптивный (12k старт / 20k после
             # подтверждения GPU) и не более окна модели минус генерация.
             budget = max(2048, min(window_cap - gen_reserve, prompt_budget))
-            # FIX (логи 00:56/10:48): раньше префлайт строил probe БЕЗ
-            # истории диалога, а реальный запрос — С историей; при втором+
-            # вопросе оценка занижалась на 1-3k токенов, фильтр пропускал
-            # перегруз и Ollama снова молчала (eval_count=None,
-            # done_reason='length'). Теперь метрика probe идентична
-            # финальному messages.
-            hist = _to_dicts(self.history)
-
+            # FIX (лог 20:43, откат идеи 00:56): probe строится БЕЗ истории
+            # диалога. История после первого вопроса занимает 2-6k токенов и
+            # съедала бюджет префлайта — фильтр выбрасывал релевантные блоки
+            # («§ 13. ВЫВОД ФОРМУЛЫ ТЕЙЛОРА…»), хотя llm_engine._trim_history
+            # сам обрезает историю до окна модели перед отправкой в Ollama.
+            # Бюджет префлайта теперь относится к «чистому» RAG-промпту;
+            # история — ответственность движка (окно num_ctx считается с
+            # запасом на генерацию, слоты не переполняются).
             def _probe_est(chunks):
-                """Оценка промпта «как в бою»: через probe_fit движка — тот
-                же chat-шаблон, история и скользящее окно, что реально
-                уйдут в Ollama (FIX логов 11:29: голова оценка по тексту
-                контекста занижала метрику на ~15%, и префлайт пропускал
-                перегруз -> пустые ответы при num_ctx 12-16k)."""
+                """Оценка промпта через probe_fit движка — тот же
+                chat-шаблон и скользящее окно, что реально уйдут в Ollama
+                (FIX логов 11:29: голая оценка по тексту контекста занижала
+                метрику на ~15%, и префлайт пропускал перегруз -> пустые
+                ответы при num_ctx 12-16k)."""
                 msgs = self.prompt_builder.build_rag_prompt(
-                    question, chunks, history=hist)
+                    question, chunks, history=None)
                 fit = None
                 try:
                     fit = self.llm.probe_fit(msgs)
@@ -507,11 +690,54 @@ class RAGPipeline:
                 est = _probe_est(context_chunks)
                 if est <= budget:
                     break
-                dropped = context_chunks.pop()
+                dropped = None
+                # FIX (логи 14:30): не выбрасываем релевантные вопросу блоки.
+                # Ищем наименее релевантный блок, который ещё можно снять без
+                # потери «покрытия» вопросных слов; если такого нет — все
+                # оставшиеся блоки релевантны и снимать их нельзя: вместо
+                # выброса ужимаем самый крупный защищённый блок окном вокруг
+                # релевантной части (_fit_block_to_budget).
+                qwords = set(re.findall(r"[а-яёa-z0-9]{3,}",
+                                        question.lower())) - self._STOPWORDS
+                covered = set()
+                for c in context_chunks:
+                    tl = str(c.get("text") or "").lower()
+                    covered |= {w for w in qwords
+                                if w[:5] in tl or w in tl}
+                for i in range(len(context_chunks) - 1, 0, -1):
+                    tl = str(context_chunks[i].get("text") or "").lower()
+                    own = {w for w in qwords if w[:5] in tl or w in tl}
+                    if not own or (covered - own) == covered:
+                        dropped = context_chunks.pop(i)
+                        covered -= own
+                        break
+                if dropped is None:
+                    # Все блоки несут уникальное покрытие — ужимаем самый
+                    # большой из них (обычно это склеенный § 13 целиком).
+                    big_i = max(range(len(context_chunks)),
+                                key=lambda j: len(
+                                    str(context_chunks[j].get("text") or "")))
+                    room = max(1024, budget // 2)
+                    before_len = len(str(
+                        context_chunks[big_i].get("text") or ""))
+                    context_chunks[big_i] = self._fit_block_to_budget(
+                        context_chunks[big_i], room)
+                    after_len = len(str(
+                        context_chunks[big_i].get("text") or ""))
+                    if after_len >= before_len:
+                        # Ужимать дальше некуда — классический выброс хвоста.
+                        dropped = context_chunks.pop()
+                        logger.info(
+                            f"RAG: контекст ({est} токенов) превышает "
+                            f"эффективный бюджет окна ({budget}) — блок "
+                            f"'{str(dropped.get('text') or '')[:40]}…' "
+                            f"исключён (защита от пустого ответа)")
+                    continue
                 logger.info(
                     f"RAG: контекст ({est} токенов) превышает эффективный "
-                    f"бюджет окна ({budget}) — блок '{str(dropped.get('text') or '')[:40]}…' "
-                    f"исключён (защита от пустого ответа)")
+                    f"бюджет окна ({budget}) — нерелевантный блок "
+                    f"'{str(dropped.get('text') or '')[:40]}…' исключён "
+                    f"(релевантные вопросу блоки защищены)")
         except Exception as ex:
             logger.debug(f"RAG: префлайт-проверка бюджета контекста "
                          f"пропущена ({ex})")
@@ -519,7 +745,76 @@ class RAGPipeline:
         messages = self.prompt_builder.build_rag_prompt(
             question, context_chunks, history=_to_dicts(self.history)
         )
-        answer = self._chat_with_retry(messages)
+        # FIX (логи 14:32/14:55): большой контекст на грани бюджета модель либо
+        # «глотает» молча (done_reason='length', content='' — KV-кэш не
+        # отрендерен), либо выдаёт оборванный хвост. Поэтому сначала идёт
+        # SAFEGUARD: финальный промпт принудительно вписывается в бюджет
+        # (снятие нерелевантных хвостов, ужимание единственного блока). Если
+        # после этого промпт всё ещё занимает >70% бюджета — включается
+        # двухпроходная схема в духе LangChain Map-Reduce / LlamaIndex
+        # CompactAndRefine:
+        #   проход «map» — по каждому блоку контекста модель извлекает только
+        #     релевантные вопросу тезисы/формулы (короткий промпт, короткий
+        #     ответ — пустота физически невозможна);
+        #   проход «synthesize» — итоговый ответ строится уже по компактным
+        #     выжимкам (~2-4k токенов вместо 16k).
+        # Карта также служит страховкой: если прямой запрос вернул пустоту,
+        # ответ собирается картой. Стоимость карты — +N коротких генераций;
+        # при подтверждённом GPU это секунды на блок.
+        map_notes: List[Dict[str, Any]] = []
+
+        # SAFEGUARD (логи 14:32): префлайт выше работает на метрике probe —
+        # если из-за сбоя probe_fit/оценки в бой всё равно идёт промпт за
+        # пределом ЭФФЕКТИВНОГО бюджета модели, Ollama отвечает молча
+        # (done_reason='length', eval_count=None). Проверяем финальный
+        # промпт ещё раз и принудительно срезаем блоки с конца.
+        try:
+            hard_budget = self.llm.effective_prompt_budget()
+        except Exception:  # noqa: BLE001  # старые движки без метода
+            from .llm_engine import _EFFECTIVE_PROMPT_TOKENS as hard_budget  # type: ignore[no-redef]
+        guard_est = self._estimate_full_prompt(question, context_chunks)
+        if guard_est != math.inf and guard_est > hard_budget:
+            # Снятие идёт с конца списка; после _protect_relevant там стоят
+            # наименее релевантные блоки. Если снять все хвосты не хватает и
+            # остаётся единственный защищённый блок — ужимаем его окном
+            # вокруг релевантной части (выбрасывать источник ответа нельзя).
+            while len(context_chunks) > 1:
+                dropped = context_chunks.pop()
+                guard_est = self._estimate_full_prompt(
+                    question, context_chunks)
+                logger.info(
+                    f"RAG: safeguard — финальный промпт ({guard_est} ток.) "
+                    f"превышает бюджет ({hard_budget}) — блок "
+                    f"'{str(dropped.get('text') or '')[:40]}…' снят")
+                if guard_est <= hard_budget:
+                    break
+            if guard_est > hard_budget and context_chunks:
+                context_chunks[0] = self._fit_block_to_budget(
+                    context_chunks[0], hard_budget)
+                guard_est = self._estimate_full_prompt(
+                    question, context_chunks)
+                logger.info(
+                    f"RAG: safeguard — единственный оставшийся релевантный "
+                    f"блок ужат до бюджета (~{guard_est} ток.)")
+            messages = self.prompt_builder.build_rag_prompt(
+                question, context_chunks, history=_to_dicts(self.history))
+
+        use_map = (guard_est != math.inf and guard_est > hard_budget * 0.7
+                   and len(context_chunks) >= 2)
+
+        answer = ""
+        if use_map:
+            logger.info(
+                f"RAG: контекст {guard_est} ток. (>70% бюджета {hard_budget}) — "
+                f"двухпроходный режим map→synthesize ({len(context_chunks)} "
+                f"блоков) вместо одного перегруженного промпта")
+            answer, map_notes = self._map_reduce_answer(question, context_chunks)
+        if not (answer or "").strip():
+            answer = self._chat_with_retry(messages)
+            if not (answer or "").strip() and not use_map:
+                # Прямой запрос молчит, а карта ещё не пробовалась — пробуем её.
+                answer, map_notes = self._map_reduce_answer(
+                    question, context_chunks)
         answer = self._strip_code_fences(answer)
         # FIX («ИИ-коллаж»): снятие «коллажа» до извлечения источников —
         # изолированные куски с [N] на каждой строке, дубли предложений и
@@ -553,6 +848,90 @@ class RAGPipeline:
 
         return {"answer": answer, "sources": sources, "context_chunks": context_chunks}
 
+    # Лимит блоков в карте: лишние (наименее релевантные) просто не участвуют —
+    # их покрытие и так обеспечено соседними блоками после _merge_adjacent.
+    _MAP_MAX_BLOCKS = 6
+    # Жёсткий потолок выжимки на блок (символов): map-ответ заведомо короткий,
+    # поэтому пустота из-за перегруза окна в этом проходе физически невозможна.
+    _MAP_NOTE_CHARS = 900
+
+    def _map_reduce_answer(self, question: str,
+                           context_chunks: List[Dict[str, Any]]
+                           ) -> Tuple[str, List[Dict[str, Any]]]:
+        """Двухпроходный ответ «map → synthesize» (паттерн LangChain
+        Map-Reduce / LlamaIndex CompactAndRefine, адаптированный под локаль).
+
+        Проблема (логи 14:32/14:55): один промпт на 16-21k токенов упирался в
+        лимит KV-кэша/слотов Ollama — модель возвращала done_reason='length'
+        с ПУСТЫМ content, а каскады перезапросов лишь повторяли ту же ошибку.
+        Решение: вместо одного гигантского входа N маленьких входов:
+          1) MAP: для каждого блока контекста — короткий промпт «извлеки из
+             ФРАГМЕНТА только тезисы, определения и формулы, относящиеся к
+             вопросу; если ничего релевантного — верни слово НЕТ». Ответ <=
+             ~200 токенов, никогда не перегружает окно; нерелевантные блоки
+             отсеиваются самой моделью (дешёвая extractive-компрессия, аналог
+             LLMLingua без дополнительной модели).
+          2) SYNTHESIZE: финальный промпт собирается из выжимок (~2-4k
+             токенов) с сохранением [N]-нумерации источников.
+        Возвращает (answer, notes); answer == "" если карта не удалась —
+        вызывающий код продолжит обычный каскад _chat_with_retry.
+        """
+        blocks = context_chunks[:self._MAP_MAX_BLOCKS]
+        if len(blocks) < 2:
+            return "", []
+        notes: List[Dict[str, Any]] = []
+        try:
+            for i, chunk in enumerate(blocks, start=1):
+                text = str(chunk.get("text") or "").strip()
+                if not text:
+                    continue
+                map_msgs = [
+                    {"role": "system", "content":
+                        "Ты — точный экстрактор учебного материала. Отвечай "
+                        "кратко, markdown/LaTeX как в источнике."},
+                    {"role": "user", "content":
+                        f"Вопрос: {question}\n\nФрагмент учебника [{i}]:\n"
+                        f"{text[:6000]}\n\nИзвлеки из фрагмента ТОЛЬКО "
+                        "утверждения, определения, теоремы и формулы "
+                        "(сохрани запись $$...$$), которые относятся к "
+                        "вопросу. Максимум 5 пунктов по одному предложению. "
+                        "Если в фрагменте нет ответа на вопрос — напиши ровно: "
+                        "НЕТ"},
+                ]
+                part = ""
+                try:
+                    part = (self.llm.chat(map_msgs) or "").strip()
+                except Exception as ex:  # noqa: BLE001 — один блок не роняет карту
+                    logger.debug(f"RAG map: блок [{i}] пропущен ({ex})")
+                    continue
+                if not part or part.strip().rstrip(".!").upper() == "НЕТ":
+                    continue
+                notes.append({"idx": i, "note": part[:self._MAP_NOTE_CHARS],
+                              "chunk": chunk})
+            if not notes:
+                return "", []
+            merged = "\n\n".join(
+                f"[{n['idx']}] {n['note']}" for n in notes)
+            syn_msgs = self.prompt_builder.build_rag_prompt(
+                question, [{"text": merged,
+                            "metadata": normalize_metadata(
+                                notes[0]["chunk"].get("metadata"))}],
+                history=_to_dicts(self.history))
+            # Выжимки короче оригинала в 3-6 раз — num_predict можно отдать
+            # полный бюджет генерации: ответ обязан быть содержательным.
+            answer = (self.llm.chat(syn_msgs) or "").strip()
+            if answer:
+                logger.info(
+                    f"RAG map→synthesize: {len(notes)}/{len(blocks)} блоков "
+                    f"дали материал, выжимки {len(merged)} симв. вместо "
+                    f"{sum(len(str(c.get('text') or '')) for c in blocks)} "
+                    f"симв. контекста")
+            return answer, notes
+        except Exception as ex:  # noqa: BLE001 — карта косметична: пустой
+            # возврат передаёт управление обычному каскаду спасения
+            logger.warning(f"RAG: двухпроходный режим не удался ({ex})")
+            return "", []
+
     def _chat_with_retry(self, messages: List[Dict[str, Any]]) -> str:
         """Запрос к LLM с каскадом спасения при пустом выводе.
 
@@ -571,6 +950,28 @@ class RAGPipeline:
         answer = self.llm.chat(messages)
         if (answer or "").strip():
             return answer
+
+        # FIX (лог 15:12): до слепого повтора того же обречённого запроса —
+        # попытка с ПРИНУДИТЕЛЬНЫМ отключением reasoning (think=False). Если
+        # модель «Qwen3.5-9B»/QwQ съела весь бюджет num_predict скрытыми
+        # thinking-токенами (done_reason='length', eval_count=None, content=''),
+        # именно этот шаг даёт ей шанс ответить по существу. Хранит переключатель
+        # движок (_force_think_off), мы лишь страхуемся явным option'ом.
+        try:
+            forced = [dict(m) for m in messages]
+            opts_backup = getattr(self.llm, "_thinking_override", None)
+            self.llm._thinking_override = False  # think=False для этого запроса
+            try:
+                logger.warning(
+                    "RAG: пустой ответ модели — перезапрос с think=False "
+                    "(отключён скрытый reasoning, съедающий бюджет генерации)")
+                answer = self.llm.chat(forced)
+            finally:
+                self.llm._thinking_override = opts_backup
+            if (answer or "").strip():
+                return answer
+        except Exception as ex:  # noqa: BLE001 — каскад не роняет конвейер
+            logger.debug(f"RAG: шаг think=False не удался ({ex})")
 
         logger.warning("RAG: пустой ответ модели — повторяю запрос один раз")
         answer = self.llm.chat(messages)
@@ -667,26 +1068,75 @@ class RAGPipeline:
     _SOURCES_HEAD_RE = re.compile(r"^\s{0,3}#{1,6}\s*[\U0001F4DA\s]*[Ии]сточники.*$",
                                   re.M)
 
+    @staticmethod
+    def _math_key(s: str) -> str:
+        """Ключ сравнения для дедупликации: LaTeX-маркеры ($, {, }, \\) вырезаются,
+        регистр/пунктуация игнорируются — «Лемма **X** $\\alpha$» и «Лемма X α»
+        дают один ключ. Используется _dedupe_sentences (баг 2 скриншотов:
+        модель печатает блок дважды — сначала с разметкой, потом плоско).
+
+        FIX (тесты): плоская версия блока содержит Unicode-глифы («α = inf X»),
+        а размеченная — LaTeX-команды («\\alpha = \\inf X»). Оба варианта
+        приводятся к одному канону: глиф ↔ имя команды (карты _MATH_CANON /
+        _MATH_NAME_MAP), индексы x₀/x_0 сворачиваются через _SUBSUP_TRANS."""
+        k = re.sub(r"[${}\\]", "", s)
+        # канал 1: глиф → ASCII-токен; канал 2: имена команд → тот же токен
+        for gl in sorted(_MATH_CANON, key=len, reverse=True):
+            k = k.replace(gl, " " + _MATH_CANON[gl] + " ")
+        k = k.translate(_SUBSUP_TRANS)
+        k = re.sub(r"\b(?:%s)\b" % "|".join(sorted(_MATH_NAME_MAP, key=len, reverse=True)),
+                   lambda m: _MATH_NAME_MAP[m.group(0)], k.lower())
+        return re.sub(r"[\W_]+", "", k.lower())
+
     def _dedupe_sentences(self, text: str) -> str:
-        """Удаляет подряд идущие дубликаты предложений (главный симптом
-        коллажа: модель печатает одно и то же предложение дважды)."""
+        """Удаляет подряд идущие дубликаты предложений и блоков (главный симптом
+        коллажа: модель печатает одно и то же дважды).
+
+        FIX (баг 2 жалобного анализа): раньше сравнивались ТОЛЬКО соседние
+        предложения через regex-разделители [.!?], а «Лемма …» / «Доказательство …»
+        оканчиваются формулой ($...$) или двоеточием — такие блоки никогда не
+        матчились и дубликаты доходили до пользователя. Теперь:
+        1) абзацы-дубликаты (ключ = текст без LaTeX-маркеров) — второй снимается;
+        2) предложения-дубликаты (прежний путь, но ключ тоже math-insensitive).
+        Идемпотентно; таблицы и $$-блоки не трогаются."""
+        # --- уровень 1: дубли абзацев (с учётом разницы в разметке) ---
+        paras = re.split(r"\n\s*\n", text)
+        seen: set = set()
+        out_p: List[str] = []
+        for p in paras:
+            key = self._math_key(p)
+            if len(key) >= 40 and key in seen:
+                continue  # нормализованный дубль убираем, оригинал уже сохранён выше
+            if len(key) >= 40:
+                seen.add(key)
+            out_p.append(p)
+        text = "\n\n".join(out_p)
+
+        # --- уровень 2: подряд идущие предложения-дубликаты ---
+        # FIX (тест T5): границы предложений определяем НЕ по [.!?] внутри
+        # текста, а по знаку в КОНЦЕ сегмента — иначе «P_n(x).» и формулы с
+        # точками/скобками разрывались на куски, дубликаты не матчились.
         changed = True
         while changed:
             changed = False
-            for m in re.finditer(r"(?P<s>[^.!?\n]{20,}[.!?])(?P<ws>[ \t]*|\n+)(?=\.!\?A-Za-zА-Яа-я«”\\$])",
-                                 text):
-                s = m.group("s").strip()
-                after = text[m.end():]
-                nxt = re.match(r"\s*(?P<t>[^.!?\n]{20,}[.!?])", after)
-                if not nxt:
+            parts = re.split(r"(\s+)", text)   # сохраняем разделители
+            for i in range(len(parts) - 2, -1, -2):
+                s, w, t = parts[i], parts[i + 1], parts[i + 2] if i + 2 < len(parts) else ""
+                if not t:
                     continue
-                t = nxt.group("t").strip()
-                key_s = re.sub(r"[\W_]+", "", s.lower())[:80]
-                key_t = re.sub(r"[\W_]+", "", t.lower())[:80]
-                if key_s and key_s == key_t:
-                    text = text[:m.start()] + text[m.end():]
+                a = s.strip(); b = t.strip()
+                if len(a) < 20 or len(b) < 20:
+                    continue
+                ka = self._math_key(a)[:80]; kb = self._math_key(b)[:80]
+                if ka and ka == kb:
+                    # убираем первое вхождение (и его хвостовой пробел)
+                    parts[i:i + 2] = ["", ""]
+                    text = "".join(parts)
                     changed = True
                     break
+            if changed:
+                continue
+            break
         return text
 
     def _anti_collage(self, answer: str) -> str:
@@ -810,7 +1260,8 @@ class RAGPipeline:
                 text_len = len(node.get("text") or "")
                 if total_chars + text_len > budget:
                     break
-                meta = normalize_metadata(node.get("metadata"))
+                # AUDIT (чистка кода): meta был мёртвой переменной — метаданные
+                # узла графа собираются явно в item["metadata"] ниже.
                 item = {
                     "id": bid,
                     "chunk_id": bid,
