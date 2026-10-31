@@ -89,6 +89,17 @@ def normalize_punctured_variants(text: str) -> str:
 # ---------------------------------------------------------------------------
 _RE_DISPLAY_TEXBRACK = re.compile(r"\\\[(.+?)\\\]", re.DOTALL)
 _RE_INLINE_TEXPAR = re.compile(r"\\\((.+?)\\\)", re.DOTALL)
+# FIX (аудит «галлюцинации тегов», категория 1): мелкие модели вставляют LaTeX-
+# окружения, которые KaTeX не поддерживает вообще: \begin{equation}...\end{...},
+# align*, gather, multline, displaymath, eqnarray. Их содержимое уходило во
+# фронтенд сырым кодом («\begin{equation}x^2\end{equation}» — парсер падает на
+# первой же команде). Канонизируем в $$...$$; многострочные выравнивания
+# (align/eqnarray) склеиваются в один блок с переносом через \\ (KaTeX-legal).
+_RE_TEXENV = re.compile(
+    r"\\begin\{(equation\*?|align\*?|gather\*?|multline\*?|eqnarray\*?"
+    r"|displaymath)\}(.*?)\\end\{\1\}",
+    re.DOTALL,
+)
 
 # Голые math-глифы: последовательности вида «∀x ∈ ℝ», «aₙ → a» модель часто
 # выводит без $...$. Оборачиваем плотные зацепки в $...$ (только если внутри
@@ -348,7 +359,17 @@ def normalize_math_delimiters(text: str) -> str:
     if not text:
         return text
 
+    def _texenv_repl(m: re.Match) -> str:
+        body = m.group(2).strip()
+        # align/eqnarray: амперсанды-выравнивания KaTeX в plain $$ не варит —
+        # снимаем их (смысл формул сохраняется, верстка упрощается).
+        if m.group(1).startswith(("align", "eqnarray")):
+            body = body.replace("&", " ")
+        return "$$" + body + "$$"
+
     def _seg(seg: str) -> str:
+        # Сначала окружения (могли содержать \[...\] внутри), затем скобки.
+        seg = _RE_TEXENV.sub(_texenv_repl, seg)
         seg = _RE_DISPLAY_TEXBRACK.sub(lambda m: "$$" + m.group(1).strip() + "$$", seg)
         seg = _RE_INLINE_TEXPAR.sub(lambda m: "$ " + m.group(1).strip() + " $", seg)
         # Псевдо-дроби из текстового слоя PDF (fract^(k)(x 0)k!, a/b c):
